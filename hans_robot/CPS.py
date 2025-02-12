@@ -1336,7 +1336,7 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def read_pos(self, boxID=0, rbtID=0):
+    def getTCPPose(self, boxID=0, rbtID=0):
         pose = []
         self.HRIF_ReadActPos(boxID, rbtID, pose)
         pose = [float(num) for num in pose]
@@ -2743,7 +2743,7 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def moveJ_robot(self, target_joint, boxID=0, rbtID=0, speed=30, acceleration=50, radius=0, isJoint=1):
+    def moveByJoint(self, target_joint, boxID=0, rbtID=0, speed=30, acceleration=50, radius=0, isJoint=1):
         """
         通过关节插补方式移动机器人到目标位姿。
 

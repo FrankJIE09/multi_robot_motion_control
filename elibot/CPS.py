@@ -3,6 +3,7 @@ import json
 import time
 import numpy as np
 
+
 class CPSClient:
     def __init__(self, ip, port=8055):
         self.ip = ip
@@ -60,11 +61,11 @@ class CPSClient:
             result_pose = json.loads(result_pose)
         return result_pose
 
-    def moveByJoint(self, targetPos, speed, block=True):
+    def moveByJoint(self, target_joint, speed=10, block=True):
 
-        suc, result, _ = self.sendCMD("moveByJoint", {"targetPos": targetPos, "speed": speed})
+        suc, result, _ = self.sendCMD("moveByJoint", {"targetPos": target_joint, "speed": speed})
         if suc:
-            print(f"Move command sent: Target position {targetPos} with speed {speed}")
+            print(f"Move command sent: Target position {target_joint} with speed {speed}")
             if block:
                 while True:
                     _, state, _ = self.sendCMD("getRobotState")
@@ -95,7 +96,7 @@ class CPSClient:
 
     def alignZAxis(self):
         # Get the current TCP pose
-        current_pose = self.read_pos()
+        current_pose = self.getTCPPose()
         current_pose[3:] = [180, 0, 0]
         target_pose = current_pose
 
@@ -110,9 +111,9 @@ if __name__ == "__main__":
     robot_ip = "192.168.11.8"
     controller = CPSClient(robot_ip)
     if controller.connect():
-        print(controller.read_pos())
+        print(controller.getTCPPose())
         print(controller.getJointPos())
-        pose = controller.read_pos()
+        pose = controller.getTCPPose()
         pose[2] = pose[2] + 10
         # print(controller.inverseKinematic(targetPose=pose))
         # controller.move_robot(pose)
