@@ -240,7 +240,7 @@ def desire_right_pose(rpy_array=None):
 
 
 if __name__ == "__main__":
-    robot_ip = "192.168.1.200"
+    robot_ip = "192.168.188.201"
     controller = CPSClient(robot_ip)
 
     if controller.connect():
@@ -250,10 +250,10 @@ if __name__ == "__main__":
         print("joint :",formatted_joint_pos)
 
         pose = controller.getTCPPose()
-        # controller.connect_gripper()
-        # controller.run_gripper(0)
-        # time.sleep(3)
-        # controller.run_gripper(255)
+        controller.connect_gripper()
+        controller.run_gripper(0)
+        time.sleep(3)
+        controller.run_gripper(255)
         #
         # _, error_state, move_state, current_position = controller.read_gripper_state()
         # print("当前位置：", current_position)
