@@ -175,7 +175,7 @@ class CPSClient:
         self.open_gripper()
         return
 
-    def run_gripper(self, target_position=0x00, force=20, speed=40):
+    def run_gripper(self, target_position=0x00, force=70, speed=40):
         # 首先清空缓存
         self.flush_tci()
         # 发送打开夹爪指令
@@ -244,16 +244,19 @@ if __name__ == "__main__":
     controller = CPSClient(robot_ip)
 
     if controller.connect():
+        pose = controller.getTCPPose()
+
         formatted_tcp_pos = [round(pos, 2) for pos in controller.getTCPPose()]
         print("pos :",formatted_tcp_pos)
         formatted_joint_pos = [round(pos, 2) for pos in controller.getJointPos()]
         print("joint :",formatted_joint_pos)
 
-        pose = controller.getTCPPose()
-        controller.connect_gripper()
-        controller.run_gripper(0)
-        time.sleep(3)
-        controller.run_gripper(255)
+
+
+        # controller.connect_gripper()
+        # controller.run_gripper(0)
+        # time.sleep(3)
+        # controller.run_gripper(255)
         #
         # _, error_state, move_state, current_position = controller.read_gripper_state()
         # print("当前位置：", current_position)
