@@ -1,7 +1,7 @@
 from CPS import *
 import cv2
 
-robot_ip = "192.168.188.201"
+robot_ip = "192.168.188.200"
 controller = CPSClient(robot_ip)
 
 if controller.connect():
