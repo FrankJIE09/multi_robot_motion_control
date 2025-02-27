@@ -259,7 +259,7 @@ def desire_right_pose(rpy_array=None):
 
 
 if __name__ == "__main__":
-    robot_ip = "192.168.188.200"
+    robot_ip = "192.168.188.201"
     controller = CPSClient(robot_ip)
 
     if controller.connect():
