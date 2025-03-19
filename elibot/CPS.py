@@ -25,6 +25,160 @@ class CPSClient:
             self.sock = None
             return False
 
+    def send_power_on_cmd(self):
+        method = "set_robot_power_status"
+        params = {"status": 1}
+        ret, result, id = self.sendCMD(method, params)
+        return result
+
+    def send_power_off_cmd(self):
+        method = "set_robot_power_status"
+        params = {"status": 0}
+        ret, result, id = self.sendCMD(method, params)
+        return result
+
+    def get_power_status(self):
+        method = "get_robot_power_status"
+        ret, result, id = self.sendCMD(method)
+        if result == "2":
+            return True
+        else:
+            return False
+    def power_on(self):
+        if not self.get_power_status():
+            self.send_power_on_cmd()
+            start_time=time.time()
+            while True:
+                result=self.get_power_status()
+                if result:
+                    print("上电成功！")
+                    break
+                elif not result and time.time()-start_time>=30:
+                    print("已尝试30s，上电失败")
+                    break
+                else:
+                    print("上电中...")
+            return result
+        else:
+            return True
+
+    def power_off(self):
+        if self.get_power_status():
+            self.send_power_off_cmd()
+            start_time = time.time()
+            while True:
+                result = self.get_power_status()
+                if not result:
+                    print("下电成功！")
+                    break
+                elif result and time.time() - start_time >= 30:
+                    print("已尝试30s，下电失败")
+                    break
+                else:
+                    print("下电中...")
+            return not result
+        else:
+            return True
+
+    def clearAlarm(self):
+        ret, result, id = self.sendCMD("clearAlarm")
+        print("清 除 报 警 等 待 抱 闸 释 放")
+        # print("ret = ", ret, " ", "id = ", id)
+        if (ret == True):
+            brakeopen = []
+            b_sum = 0
+            # brakeopen 为6个轴抱闸打开情况，打开为 1，不然为 0，全部打开为[1, 1, 1, 1, 1, 1]
+            while b_sum != 6:
+                # 获取伺服抱闸打开情况
+                suc, result, id = self.sendCMD("get_servo_brake_off_status")
+                brakeopen=json.loads(result)
+                b_sum = 0
+                for d in brakeopen:
+                    b_sum = b_sum + d
+                time.sleep(0.1)
+                # 等待 6 个轴抱闸全部打开
+            print("已释放：result = ", result)
+            time.sleep(0.1)
+
+        else:
+            print("err_msg = ", result["message"])
+
+    def get_servo_status(self):
+        method = "getServoStatus"
+        ret, result, id = self.sendCMD(method)
+        if result == "true":
+            return True
+        else:
+            return False
+    def send_set_servo_cmd(self,status=1):#0为关，1为开
+        method = "set_servo_status"
+        params = {"status": status}
+        ret, result, id = self.sendCMD(method, params)
+        if result == "true":
+            return True
+        else:
+            return False
+
+    def setMotorStatus(self):
+        ret, result, id = self.sendCMD("getMotorStatus")
+        print("获取同步状态")
+        if result == "false":
+            ret1, result1, id = self.sendCMD("syncMotorStatus")
+            # print("ret = ", ret1, " ", "id = ", id)
+            if (ret1 == True):
+                print("同步成功，result = ", result1)
+                return True
+            else:
+                print("err_msg = ", result1["message"])
+                return False
+        else:
+            print(result)
+            return True
+
+    def set_servo(self,status=1):
+        arm_status=self.get_servo_status()
+        self.send_set_servo_cmd(status)
+        time.sleep(0.5)
+        if status==1:
+            if not arm_status:
+                self.send_set_servo_cmd(status)
+                start_time=time.time()
+                while True:
+                    result = self.get_servo_status()
+                    if result:
+                        print("使能成功！")
+                        break
+                    elif not result and time.time() - start_time >= 30:
+                        print("已尝试30s，使能失败")
+                        break
+                    else:
+                        print("使能中...")
+                return result
+            else:
+                return True
+        elif status == 0:
+            if arm_status:
+                self.send_set_servo_cmd(status)
+                start_time=time.time()
+                while True:
+                    result = self.get_servo_status()
+                    if not result:
+                        print("解除使能成功！")
+                        break
+                    elif result and time.time() - start_time >= 30:
+                        print("已尝试30s，解除使能失败")
+                        break
+                    else:
+                        print("正在解除使能中...")
+                return not result
+            else:
+                return True
+        else:
+            print("不合理的使能参数")
+            return False
+
+
+
     def disconnect(self):
         if self.sock:
             self.sock.close()
@@ -194,7 +348,7 @@ class CPSClient:
         self.open_gripper()
         return
 
-    def run_gripper(self, target_position=0x00, force=70, speed=40):
+    def run_gripper(self, target_position=0x00, force=255, speed=255):
         # 首先清空缓存
         self.flush_tci()
         # 发送打开夹爪指令
@@ -263,18 +417,30 @@ if __name__ == "__main__":
     controller = CPSClient(robot_ip)
 
     if controller.connect():
-        pose = controller.getTCPPose()
 
-        formatted_tcp_pos = [round(pos, 2) for pos in controller.getTCPPose()]
-        print("pos :", formatted_tcp_pos)
-        formatted_joint_pos = [round(pos, 2) for pos in controller.getJointPos()]
-        print("joint :", formatted_joint_pos)
-        # controller.moveByJoint_right([-201.58, -120.88, -114.04, -50.78, -71.61, -116.05])
-        # controller.moveByJoint([174.65, -7.11, 39.66, 65.99, -64.49, 178.81])
+        print(controller.get_power_status())
+        print(controller.get_servo_status())
+        result = controller.power_on()
+        print(result)
+        controller.clearAlarm()
+        controller.setMotorStatus()
+        print(controller.set_servo(1))
+        # print(controller.power_off())
+
+
+
+        # formatted_tcp_pos = [round(pos, 2) for pos in controller.getTCPPose()]
+        # print("pos :", formatted_tcp_pos)
+        # formatted_joint_pos = [round(pos, 2) for pos in controller.getJointPos()]
+        # print("joint :", formatted_joint_pos)
+        # # controller.moveByJoint_right([-201.58, -120.88, -114.04, -50.78, -71.61, -116.05])
+        # # controller.moveByJoint([174.65, -7.11, 39.66, 65.99, -64.49, 178.81])
         controller.connect_gripper()
-        controller.run_gripper(0)
-        time.sleep(3)
-        controller.run_gripper(255,force=255,speed=255)
+        controller.run_gripper(255)
+
+        # controller.power_off()
+        # time.sleep(3)
+        # controller.run_gripper(255,force=255,speed=255)
         #
         # _, error_state, move_state, current_position = controller.read_gripper_state()
         # print("当前位置：", current_position)
