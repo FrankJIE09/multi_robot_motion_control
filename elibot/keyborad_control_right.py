@@ -73,7 +73,7 @@ if controller.connect():
 
         # 更新速度
         print(f"Current Speed: {speed}")
-        speed[0:3] = speed[0:3] @ R.from_euler('xyz', [-65, 0, -10], degrees=True).as_matrix()
+        speed[0:3] = speed[0:3] @ R.from_euler('xyz', [65.33430565, -4.20854252,-9.07946747], degrees=True).as_matrix()
         speed[3:] = [0, 0, 0]
         # 发送速度命令到机器人
         suc, result, _ = controller.moveBySpeedl(list(speed), acc, arot, t)

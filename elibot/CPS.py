@@ -44,16 +44,17 @@ class CPSClient:
             return True
         else:
             return False
+
     def power_on(self):
         if not self.get_power_status():
             self.send_power_on_cmd()
-            start_time=time.time()
+            start_time = time.time()
             while True:
-                result=self.get_power_status()
+                result = self.get_power_status()
                 if result:
                     print("上电成功！")
                     break
-                elif not result and time.time()-start_time>=30:
+                elif not result and time.time() - start_time >= 30:
                     print("已尝试30s，上电失败")
                     break
                 else:
@@ -91,7 +92,7 @@ class CPSClient:
             while b_sum != 6:
                 # 获取伺服抱闸打开情况
                 suc, result, id = self.sendCMD("get_servo_brake_off_status")
-                brakeopen=json.loads(result)
+                brakeopen = json.loads(result)
                 b_sum = 0
                 for d in brakeopen:
                     b_sum = b_sum + d
@@ -110,7 +111,8 @@ class CPSClient:
             return True
         else:
             return False
-    def send_set_servo_cmd(self,status=1):#0为关，1为开
+
+    def send_set_servo_cmd(self, status=1):  # 0为关，1为开
         method = "set_servo_status"
         params = {"status": status}
         ret, result, id = self.sendCMD(method, params)
@@ -135,14 +137,14 @@ class CPSClient:
             print(result)
             return True
 
-    def set_servo(self,status=1):
-        arm_status=self.get_servo_status()
+    def set_servo(self, status=1):
+        arm_status = self.get_servo_status()
         self.send_set_servo_cmd(status)
         time.sleep(0.5)
-        if status==1:
+        if status == 1:
             if not arm_status:
                 self.send_set_servo_cmd(status)
-                start_time=time.time()
+                start_time = time.time()
                 while True:
                     result = self.get_servo_status()
                     if result:
@@ -159,7 +161,7 @@ class CPSClient:
         elif status == 0:
             if arm_status:
                 self.send_set_servo_cmd(status)
-                start_time=time.time()
+                start_time = time.time()
                 while True:
                     result = self.get_servo_status()
                     if not result:
@@ -176,8 +178,6 @@ class CPSClient:
         else:
             print("不合理的使能参数")
             return False
-
-
 
     def disconnect(self):
         if self.sock:
@@ -222,7 +222,7 @@ class CPSClient:
     def moveByJoint(self, target_joint, speed=10, block=True):
         if target_joint[0] <= 120:
             print(target_joint[0])
-            raise Exception("Joint1 over limit!",target_joint[0])
+            raise Exception("Joint1 over limit!", target_joint[0])
         suc, result, _ = self.sendCMD("moveByJoint", {"targetPos": target_joint, "speed": speed})
         if suc:
             print(f"Move command sent: Target position {target_joint} with speed {speed}")
@@ -235,9 +235,10 @@ class CPSClient:
                     time.sleep(0.1)
         else:
             raise Exception("Failed to move robot to the target joint.")
+
     def moveByJoint_right(self, target_joint, speed=10, block=True):
         if target_joint[0] >= -120:
-            raise Exception("Joint1 over limit!.",target_joint[0])
+            raise Exception("Joint1 over limit!.", target_joint[0])
         suc, result, _ = self.sendCMD("moveByJoint", {"targetPos": target_joint, "speed": speed})
         if suc:
             print(f"Move command sent: Target position {target_joint} with speed {speed}")
@@ -250,6 +251,7 @@ class CPSClient:
                     time.sleep(0.1)
         else:
             raise Exception("Failed to move robot to the target joint.")
+
     def moveBySpeedl(self, speed_l, acc, arot, t, id=1):
         params = {"v": speed_l, "acc": acc, "arot": arot, "t": t}
         return self.sendCMD("moveBySpeedl", params, id)
@@ -265,12 +267,21 @@ class CPSClient:
 
     def move_robot(self, target_pose, speed=10):
         iK_joint = self.inverseKinematic(target_pose)
+        current_pos = self.getJointPos()
+
+        # 对比每个对应的关节角差值
+        for idx, (ik_val, pos_val) in enumerate(zip(iK_joint, current_pos)):
+            diff = abs(ik_val - pos_val)
+            if diff > 90:
+                raise ValueError(f"第 {idx + 1} 个关节的角度差值 {diff} 超过 90 度！")
         self.moveByJoint(iK_joint, speed=speed)
         return
+
     def move_right_robot(self, target_pose, speed=10):
         iK_joint = self.inverseKinematic(target_pose)
         self.moveByJoint_right(iK_joint, speed=speed)
         return
+
     def alignZAxis(self):
         # Get the current TCP pose
         current_pose = self.getTCPPose()
@@ -403,7 +414,7 @@ def desire_right_pose(rpy_array=None):
     # 计算 inv(rpy = (65, 0, 10)) @ rpy = (180, 0, 0)
     if rpy_array is None:
         rpy_array = [180, 0, 180]
-    rpy_inv_65_0_10 = R.from_euler('xyz', [-65, 0, -10], degrees=True).inv()
+    rpy_inv_65_0_10 = R.from_euler('xyz', [65.33430565, -4.20854252,-9.07946747], degrees=True).inv()
     rpy = R.from_euler('xyz', rpy_array, degrees=True)
 
     # 计算旋转矩阵
@@ -417,7 +428,6 @@ if __name__ == "__main__":
     controller = CPSClient(robot_ip)
 
     if controller.connect():
-
         print(controller.get_power_status())
         print(controller.get_servo_status())
         result = controller.power_on()
@@ -425,18 +435,20 @@ if __name__ == "__main__":
         controller.clearAlarm()
         controller.setMotorStatus()
         print(controller.set_servo(1))
+        pose = controller.getTCPPose()
+        # joint =controller.getJointPos()
+        # print("Joint : ",joint)
+        #
         # print(controller.power_off())
 
-
-
-        # formatted_tcp_pos = [round(pos, 2) for pos in controller.getTCPPose()]
-        # print("pos :", formatted_tcp_pos)
-        # formatted_joint_pos = [round(pos, 2) for pos in controller.getJointPos()]
-        # print("joint :", formatted_joint_pos)
+        formatted_tcp_pos = [round(pos, 2) for pos in controller.getTCPPose()]
+        print("pos :", formatted_tcp_pos)
+        formatted_joint_pos = [round(pos, 2) for pos in controller.getJointPos()]
+        print("joint :", formatted_joint_pos)
         # # controller.moveByJoint_right([-201.58, -120.88, -114.04, -50.78, -71.61, -116.05])
         # # controller.moveByJoint([174.65, -7.11, 39.66, 65.99, -64.49, 178.81])
-        controller.connect_gripper()
-        controller.run_gripper(255)
+        # controller.connect_gripper()
+        # controller.run_gripper(255)
 
         # controller.power_off()
         # time.sleep(3)
@@ -445,6 +457,8 @@ if __name__ == "__main__":
         # _, error_state, move_state, current_position = controller.read_gripper_state()
         # print("当前位置：", current_position)
         # exit()
+        # pose = controller.getJointPos()
+        # print(pose)
         # pose[2] = pose[2] + 10
         # rpy_angles = desire_left_pose(rpy_array=[180,0,180]) # left 垂直向下
         # pose[3:6] = rpy_angles
@@ -464,19 +478,29 @@ if __name__ == "__main__":
         # controller.move_robot(pose)
         # rpy_angles = desire_left_pose(rpy_array=[-90, -90, 0])  # left 水平向右 相机朝上
         # pose[3:6] = rpy_angles
-        # controller.move_robot(pose)
+        # controller.move_robot(pose)_array=[0,-120
         # rpy_angles = desire_left_pose(rpy_array=[0,-120,0]) # left 斜向前
         # pose[3:6] = rpy_angles
         # controller.move_robot(pose)
-
         # rpy_angles = desire_right_pose(rpy_array=[180, 0, 180])  # right 垂直向下
         # pose[3:6] = rpy_angles
-        # controller.move_right_robot(pose)
         #
-        # rpy_angles = desire_right_pose(rpy_array=[0, -90, 0])  # right 水平向前
-        # pose[3:6] = rpy_angles
         # controller.move_right_robot(pose)
 
+        # rpy_angles = desire_right_pose(rpy_array=[180, -90, 0])  # right 水平向前
+        # pose[3:6] = rpy_angles
+        # controller.move_right_robot(pose)
+        exit()
+
+        rpy_angles = desire_right_pose(rpy_array=[-90, 0, 0])  # right 水平向左
+        pose[3:6] = rpy_angles
+        controller.move_right_robot(pose)
+        matrix = R.from_euler('xyz', [65.33430565, -4.20854252,-9.07946747], degrees=True).as_matrix()
+
+        offset = np.array([-0, 0, 20]) @ matrix
+        pose[:3] = pose[:3] + offset
+        print("Moving down to grab the object...")
+        controller.move_right_robot(pose)
         # rpy_angles = desire_right_pose(rpy_array=[-90,0,180]) # left 水平向左 相机朝前
         # pose[3:6] = rpy_angles
         # controller.move_right_robot(pose)
