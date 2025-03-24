@@ -265,7 +265,7 @@ class CPSClient:
             iK_joint = json.loads(iK_joint)
         return iK_joint
 
-    def move_robot(self, target_pose, speed=10):
+    def move_robot(self, target_pose, speed=10,block=True):
         iK_joint = self.inverseKinematic(target_pose)
         current_pos = self.getJointPos()
 
@@ -274,12 +274,12 @@ class CPSClient:
             diff = abs(ik_val - pos_val)
             if diff > 90:
                 raise ValueError(f"第 {idx + 1} 个关节的角度差值 {diff} 超过 90 度！")
-        self.moveByJoint(iK_joint, speed=speed)
+        self.moveByJoint(iK_joint, speed=speed,block=block)
         return
 
-    def move_right_robot(self, target_pose, speed=10):
+    def move_right_robot(self, target_pose, speed=10,block=True):
         iK_joint = self.inverseKinematic(target_pose)
-        self.moveByJoint_right(iK_joint, speed=speed)
+        self.moveByJoint_right(iK_joint, speed=speed,block=block)
         return
 
     def alignZAxis(self):
@@ -424,7 +424,7 @@ def desire_right_pose(rpy_array=None):
 
 
 if __name__ == "__main__":
-    robot_ip = "192.168.188.201"
+    robot_ip = "192.168.188.200"
     controller = CPSClient(robot_ip)
 
     if controller.connect():
@@ -490,17 +490,17 @@ if __name__ == "__main__":
         # rpy_angles = desire_right_pose(rpy_array=[180, -90, 0])  # right 水平向前
         # pose[3:6] = rpy_angles
         # controller.move_right_robot(pose)
-        exit()
+        # exit()
 
-        rpy_angles = desire_right_pose(rpy_array=[-90, 0, 0])  # right 水平向左
-        pose[3:6] = rpy_angles
-        controller.move_right_robot(pose)
-        matrix = R.from_euler('xyz', [65.33430565, -4.20854252,-9.07946747], degrees=True).as_matrix()
+        # rpy_angles = desire_right_pose(rpy_array=[-90, 0, 0])  # right 水平向左
+        # pose[3:6] = rpy_angles
+        # controller.move_right_robot(pose)
+        # matrix = R.from_euler('xyz', [65.33430565, -4.20854252,-9.07946747], degrees=True).as_matrix()
 
-        offset = np.array([-0, 0, 20]) @ matrix
-        pose[:3] = pose[:3] + offset
-        print("Moving down to grab the object...")
-        controller.move_right_robot(pose)
+        # offset = np.array([-0, 0, 20]) @ matrix
+        # pose[:3] = pose[:3] + offset
+        # print("Moving down to grab the object...")
+        # controller.move_right_robot(pose)
         # rpy_angles = desire_right_pose(rpy_array=[-90,0,180]) # left 水平向左 相机朝前
         # pose[3:6] = rpy_angles
         # controller.move_right_robot(pose)
