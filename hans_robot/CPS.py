@@ -3,18 +3,16 @@
 
 import time
 from tokenize import Double
-import xmlrpc.client
 import socket
 import os
 import struct
 from enum import IntEnum
-import numpy as np
 
 
 # from yaml import compose_all
 
 class RbtFSM(IntEnum):
-    enCPSState_UnInitialize = 0
+    enCPSState_PreInitialize = 0
     enCPSState_Initialize = 1  # 1 初始化
     # 电箱状态机
     enCPSState_ElectricBoxDisconnect = 2  # 2 与电箱控制板断开
@@ -30,7 +28,7 @@ class RbtFSM(IntEnum):
     enCPSState_SafetyGuard = 12  # 12 安全光幕
     # controller状态机
     enCPSState_ControllerDisconnecting = 13  # 13 正在反初始化控制器
-    enCPSState_ControllerDisconnect = 14  # 14 控制器已处理于未初始化状态
+    enCPSState_ControllerDisconnect = 14  # 14 控制器已处于未初始化状态
     enCPSState_ControllerConnecting = 15  # 15 正在初始化控制器
     enCPSState_ControllerVersionError = 16  # 16 控制器版本过低错误
     enCPSState_EtherCATError = 17  # 17 EtherCAT错误
@@ -50,7 +48,7 @@ class RbtFSM(IntEnum):
     enCPSState_RobotClosingFreeDriver = 30  # 30 机器人正在关闭零力示教
     enCPSState_FreeDriver = 31  # 31 机器人处于零力示教
     enCPSState_RobotHolding = 32  # 32 机器人暂停
-    enCPSState_Standy = 33  # 33 机器人就绪
+    enCPSState_StandBy = 33  # 33 机器人就绪
     # script状态机
     enCPSState_ScriptRunning = 34  # 34 脚本运行中
     enCPSState_ScriptHoldHandling = 35  # 35 脚本暂停处理中
@@ -76,80 +74,250 @@ dic_ErrorCode = {
     39501: "命令输入参数错误",
     39502: "命令响应中参数错误",
     39503: "Socket通讯错误(超时、接收异常等)",
-    39504: "跟机器人连接错误"
+    39504: "跟机器人连接错误",
+    39505: "命令接收错误",
+    20018: ""
 }
+
+import threading
+
+lock = threading.Lock()
+lock_fast = threading.Lock()
 
 
 class RbtClient(object):
     clientIP = '127.0.0.1'
     clientPort = 10003
-    xmlrpcAddr = 'http://127.0.0.1:20000'
-    m_bConnect = False
+    output_log = False
 
     # tcp = socket.socket()
 
     def __init__(self):
-        return
+        self.fast_cmd_list = []
+        self.hb_thread = None
+
+    def heartbeat_thread(self):
+        cps = CPSClient()
+        result = []
+        while True:
+            nRet = cps.HRIF_IsSimulateRobot(0, result)
+            if nRet != 0:
+                cps.HRIF_DisConnect(0)
+                break
+            time.sleep(1)
 
     def Connect2CPS(self, hostName, nPort):
-        try:
-            self.xmlrpcAddr = 'http://'
-            self.xmlrpcAddr += hostName
-            self.xmlrpcAddr += ':20000'
-            self.tcp = socket.socket()
-            print(self.xmlrpcAddr)
-            self.rpcClient = xmlrpc.client.ServerProxy(self.xmlrpcAddr)
-            self.clientIP = hostName
-            self.clientPort = nPort
-            self.tcp.connect((self.clientIP, self.clientPort))
-            self.m_bConnect = True
-            return 0
-        except:
-            self.m_bConnect = False
-            return
+        cps = CPSClient()
+        self.clientIP = hostName
+        self.tcp = socket.socket()
+        self.tcp.settimeout(5)
+        self.clientPort = nPort
+        ret = self.tcp.connect_ex((self.clientIP, self.clientPort))
+
+        if not self.hb_thread:
+            self.hb_thread = threading.Thread(target=self.heartbeat_thread)
+            self.hb_thread.setDaemon(True)
+            self.hb_thread.start()
+
+        if ret != 0:
+            self.tcp.close()
+            print("connect error [error is {0}.msg:{1}]".format(ret, os.strerror(ret)))
+            return ret
+
+        result = []
+        nRet = cps.HRIF_ReadFastCmdPort(result)
+        if nRet != 0:
+            return ret
+
+        self.fast_port = int(result[0])
+        if self.fast_port == self.clientPort:  # 当前连接的是否是快速端口
+            return ret
+
+        self.tcp_fast = socket.socket()
+        self.tcp_fast.settimeout(5)
+        ret = self.tcp_fast.connect_ex((self.clientIP, self.fast_port))
+
+        cps.HRIF_ReadCmdList(self.fast_cmd_list)
+
+        return ret
 
     def DisconnectFromCPS(self):
         self.tcp.close()
         return 0
-
-    def sendHRLog(self, nLevel, msg):
-        self.rpcClient.HRLog(int(nLevel), str(msg))
 
     def sendScriptFinish(self, errorCode):
         command = 'SendScriptFinish,0,' + str(errorCode) + ',;'
         self.tcp.send(command.encode())
         self.tcp.recv(self.clientPort).decode("utf-8", "ignore")
 
-    def sendScriptError(self, msg):
-        self.rpcClient.SendScriptError(str(msg), str(""))
+    def setOutputLog(self, output):
+        self.output_log = output
 
-    def isConnected(self):
-        return self.m_bConnect
-
-    def sendVarValue(self, boxID, rbtID, VarName, Value, result):
-        if isinstance(Value, list, result):
-            ValueStr = '['
-            for i in range(0, 6):
-                ValueStr += str(Value[i])
-                if i != 5:
-                    ValueStr += ','
-            ValueStr += ']'
-            # command = 'SendVarValue,'
-            # for i in range(0,6):
-            #    command += str(Value[i]) + ','
-            # command += ';'
+    def sendAndRecv_fast(self, cmd, result):
+        self.tcp_fast.send(cmd.encode())
+        count = 0
+        ret = ""
+        self.tcp_fast.settimeout(10)  # 设置接收超时时间为 10 秒
+        while count < 5:
+            count += 1
+            try:
+                data = self.tcp_fast.recv(4096).decode("utf-8", "ignore")
+                if self.output_log:
+                    print(data)
+                if data:
+                    ret += data
+                    if ret.endswith(';'):
+                        if cmd.split(",")[0] != ret.split(",")[0]:
+                            return 39505
+                        break
+            except socket.timeout:
+                continue  # 超时重试
         else:
-            ValueStr = str(Value)
-        # gVar = globals()
-        # gVar[VarName]=Value
-        self.rpcClient.SendVarValue(str(VarName), ValueStr)
-        # return retData
+            raise TimeoutError("接收数据超时")
+        retData_fast = ret.split(',')
+        logmsg = '[script]sendAndRecv:' + cmd
+        if len(retData_fast) < 3:
+            logmsg += ' exit with ServerReturnError'
+            return 39503
+
+        if retData_fast[0] == "errorcmd":
+            logmsg += ' exit with errorcmd'
+            return 39503
+
+        if retData_fast[1] == "Fail":
+            logmsg += ' exit with Fail[' + retData_fast[1] + ']'
+            errorData = int(retData_fast[2])
+            return errorData
+
+        # 确保 result 是一个列表
+        if not isinstance(result, list):
+            raise TypeError("result 应该是一个列表")
+
+        # 处理返回数据
+        result.clear()
+        result.extend(retData_fast[2:-1])  # 忽略前两个元素和最后一个元素
 
     def sendAndRecv(self, cmd, result):
-        # print(cmd)
         try:
+            if cmd.split(",")[0] in self.fast_cmd_list:
+                with lock_fast:
+                    if self.output_log:
+                        print(cmd)
+                    self.tcp_fast.send(cmd.encode())
+                    count = 0
+                    ret = ""
+                    self.tcp_fast.settimeout(10)  # 设置接收超时时间为 10 秒
+                    while count < 5:
+                        count += 1
+                        try:
+                            data = self.tcp_fast.recv(4096).decode("utf-8", "ignore")
+                            if self.output_log:
+                                print(data)
+                            if data:
+                                ret += data
+                                if ret.endswith(';'):
+                                    break
+                        except socket.timeout:
+                            continue  # 超时重试
+                    else:
+                        raise TimeoutError("接收数据超时")
+                retData_fast = ret.split(',')
+                logmsg = '[script]sendAndRecv:' + cmd
+                if len(retData_fast) < 3:
+                    logmsg += ' exit with ServerReturnError'
+                    return 39503
+
+                if retData_fast[0] == "errorcmd":
+                    logmsg += ' exit with errorcmd'
+                    return 39503
+
+                if retData_fast[1] == "Fail":
+                    logmsg += ' exit with Fail[' + retData_fast[1] + ']'
+                    errorData = int(retData_fast[2])
+                    return errorData
+
+                # 确保 result 是一个列表
+                if not isinstance(result, list):
+                    raise TypeError("result 应该是一个列表")
+
+                if cmd.split(",")[0] != retData_fast[0]:
+                    return 39505
+
+                # 处理返回数据
+                result.clear()
+                result.extend(retData_fast[2:-1])  # 忽略前两个元素和最后一个元素
+            else:
+                with lock:
+                    if self.output_log:
+                        print(cmd)
+                    self.tcp.send(cmd.encode())
+                    count = 0
+                    ret = ""
+                    self.tcp.settimeout(10)  # 设置接收超时时间为 10 秒
+                    while count < 5:
+                        count += 1
+                        try:
+                            data = self.tcp.recv(4096).decode("utf-8", "ignore")
+                            if self.output_log:
+                                print(data)
+                            if data:
+                                ret += data
+                                if ret.endswith(';'):
+                                    break
+                        except socket.timeout:
+                            continue  # 超时重试
+                    else:
+                        raise TimeoutError("接收数据超时")
+
+                retData = ret.split(',')
+                logmsg = '[script]sendAndRecv:' + cmd
+                if len(retData) < 3:
+                    logmsg += ' exit with ServerReturnError'
+                    return 39503
+
+                if retData[0] == "errorcmd":
+                    logmsg += ' exit with errorcmd'
+                    return 39503
+
+                if retData[1] == "Fail":
+                    logmsg += ' exit with Fail[' + retData[1] + ']'
+                    errorData = int(retData[2])
+                    return errorData
+
+                # 确保 result 是一个列表
+                if not isinstance(result, list):
+                    raise TypeError("result 应该是一个列表")
+
+                if cmd.split(",")[0] != retData[0]:
+                    return 39505
+
+                # 处理返回数据
+                result.clear()
+                result.extend(retData[2:-1])  # 忽略前两个元素和最后一个元素
+
+        except Exception as e:
+            print("发生异常:", e)
+            return 39503
+        return 0
+
+    '''def sendAndRecv(self, cmd, result):
+        try:
+            global lock
+
+            if self.output_log:
+                print(cmd)
+
+            lock.acquire() 
             self.tcp.send(cmd.encode())
-            ret = self.tcp.recv(self.clientPort).decode("utf-8", "ignore")
+            count = 0
+            ret = ""
+            self.tcp.settimeout(10)  # 设置接收超时时间为 1 秒
+            while count < 5:
+                count = count + 1
+                ret += self.tcp.recv(self.clientPort).decode("utf-8", "ignore")
+                if ret.endswith(';'):
+                    break
+            lock.release() 
             retData = ret.split(',')
             logmsg = '[script]sendAndRecv:' + cmd
             if len(retData) < 3:
@@ -164,7 +332,7 @@ class RbtClient(object):
 
             if retData[1] == "Fail":
                 logmsg = logmsg + 'exit with Fail[' + retData[1] + ']'
-                self.sendHRLog(2, logmsg)
+                # self.sendHRLog(2,logmsg)
                 errorData = int(retData[2])
                 return errorData
 
@@ -174,22 +342,20 @@ class RbtClient(object):
             result.clear()
             for i in range(0, len(retData)):
                 result.append(retData[i])
-        except:
-            self.m_bConnect = False
-            return 39500
-        return 0
+        except Exception as e:
+            print("发生异常:", e)
+            return 39503
+        return 0'''
 
 
 class CPSClient(object):
     clientIP = '127.0.0.1'
     clientPort = 10003
-    xmlrpcAddr = 'http://127.0.0.1:20000'
     g_clients = []
     MaxBox = 5
+    g_client_state = [False, False, False, False, False]
 
     dic_FSM = {
-        0: "未初始化",
-        1: "初始化",
         0: "未初始化",
         1: "初始化",
         2: "与电箱控制板断开",
@@ -204,7 +370,7 @@ class CPSClient(object):
         11: "安全光幕处理中",
         12: "安全光幕",
         13: "正在反初始化控制器",
-        14: "控制器已处理于未初始化状态",
+        14: "控制器已处于未初始化状态",
         15: "正在初始化控制器",
         16: "控制器版本过低错误",
         17: "EtherCAT错误",
@@ -223,7 +389,7 @@ class CPSClient(object):
         30: "机器人正在关闭零力示教",
         31: "机器人处于零力示教",
         32: "机器人暂停",
-        33: "机器人就绪",
+        33: "机器人准备就绪",
         34: "脚本运行中",
         35: "脚本暂停处理中",
         36: "脚本暂停",
@@ -252,37 +418,35 @@ class CPSClient(object):
         time.sleep(0.02)
         nDisableCNT = 0
         while True:
-            if (nDisableCNT >= 5):
+            if nDisableCNT >= 5:
                 time.sleep(0.01)
                 os._exit(0)
-            ret = self.HRIF_ReadRobotState(ret)
-            if (ret[1] == '0'):
+            ret = []
+            self.HRIF_ReadRobotState(0, 0, ret)
+            if ret[1] == '0':
                 nDisableCNT += 1
                 log = ('[script]EnableState[' + ret[2] + '],count[' + str(nDisableCNT) + '] error')
                 continue
             else:
                 nDisableCNT = 0
 
-            if (ret[2] == '1' or ret[7] == '1' or ret[9] == '0' or ret[10] == '0'):
+            if ret[2] == '1' or ret[7] == '1' or ret[9] == '0' or ret[10] == '0':
                 log = ('[script]errorState[' + ret[2] + '],emergency[' + ret[7] + '],Electfify[' + ret[9] + ']')
-                print(log)
+                # print(log)
                 time.sleep(0.1)
                 os._exit(0)
             elif ret[8] == '1':
                 time.sleep(0.01)
                 continue
 
-
             elif ret[6] == '1':
                 time.sleep(0.01)
                 continue
 
-
             elif ret[motionIndex] == doneFlag:
                 log = ('[script]ret[' + str(motionIndex) + ']==' + ret[motionIndex])
-                print(log)
+                # print(log)
                 break
-
 
             elif ret[motionIndex] == movingFlag:
                 log = ('ret[' + str(motionIndex) + ']==' + ret[motionIndex])
@@ -290,10 +454,45 @@ class CPSClient(object):
                 continue
 
             else:
-                log = ('[script]waitBlendingDone unknow status exit')
-                print(log)
+                log = '[script]waitBlendingDone unknow status exit'
+                # print(log)
                 os._exit(0)
         return
+
+    def waitMoveDone(self, boxID, rbtID):
+        self._waitMotion(False)
+
+    def waitBlendingDone(self, boxID, rbtID):
+        self._waitMotion(True)
+
+    def waitFSM(self, targetFSM, wait_timeout):
+        result = []
+        self.HRIF_ReadCurFSM(0, 0, result)
+        start = time.perf_counter()
+        end = time.perf_counter()
+        while int(result[0]) != targetFSM:
+            end = time.perf_counter()
+            if (end - start) >= wait_timeout:
+                break
+            time.sleep(0.1)
+            self.HRIF_ReadCurFSM(0, 0, result)
+        return int(result[0])
+
+    def HRIF_FinishInitialize(self):
+        result = []
+        command = 'FinishInitialize,;'
+        return self.g_clients[0].sendAndRecv(command, result)
+
+    def HRIF_SetOutputLog(self, output):
+        self.g_clients[0].setOutputLog(output)
+
+    def HRIF_ReadFastCmdPort(self, result):
+        command = 'ReadFastCmdPort,0,;'
+        return self.g_clients[0].sendAndRecv(command, result)
+
+    def HRIF_ReadCmdList(self, result):
+        command = 'ReadCmdList,0,;'
+        return self.g_clients[0].sendAndRecv_fast(command, result)
 
     #
     # part 1 初始化
@@ -310,7 +509,10 @@ class CPSClient(object):
         if boxID >= self.MaxBox:
             return 39501
         try:
-            self.g_clients[boxID].Connect2CPS(hostName, nPort)
+            ret = self.g_clients[boxID].Connect2CPS(hostName, nPort)
+            self.g_client_state[boxID] = True
+            if ret != 0:
+                return 39504
             return 0
         except:
             return 39504
@@ -327,6 +529,7 @@ class CPSClient(object):
             return 39501
         try:
             self.g_clients[boxID].DisconnectFromCPS()
+            self.g_client_state[boxID] = False
             return 0
         except:
             return 39504
@@ -335,12 +538,11 @@ class CPSClient(object):
     *	@index : 3
     *	@param brief:判断控制器是否连接
     *	@param boxID:电箱ID
-    *	@param return: True：已连接，False：未连接
+    *	@param return: 错误码
     '''
 
     def HRIF_IsConnected(self, boxID):
-
-        return self.g_clients[boxID].isConnected()
+        return self.g_client_state[boxID]
 
     '''
     *	@index : 4
@@ -405,19 +607,34 @@ class CPSClient(object):
 
     '''
     *	@index : 9
-    *	@param brief:是否为模拟机器人
+    *	@param brief:设置为模拟机器人
     *	@param boxID:电箱ID
-    *	@param result[0]: 1:是模拟机器人 2:不是模拟机器人
+    *	@param state: 1:是模拟机器人 0:不是模拟机器人
     *	@param return: 错误码
     '''
 
-    def HRIF_IsSimulateRobot(self, boxID, result):
-        command = 'IsSimulation,'
-        command += ';'
+    def HRIF_SetSimulation(self, boxID, state):
+        result = []
+        command = 'SetSimulation,0,'
+        command += str(state)
+        command += ',;'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
     *	@index : 10
+    *	@param brief:是否为模拟机器人
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param result[0]: 1:是模拟机器人 0:不是模拟机器人
+    *	@param return: 错误码
+    '''
+
+    def HRIF_IsSimulateRobot(self, boxID, result):
+        command = 'IsSimulation,;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 11
     *	@param brief:控制器是否启动完成
     *	@param boxID:电箱ID
     *	@param result[0]: 1:已完成 2:未完成
@@ -430,7 +647,21 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 11
+    *	@index : 12
+    *	@param brief:获取错误码解释
+    *	@param boxID:电箱ID
+    *	@param result[0]: 1:已完成 2:未完成
+    *	@param return: 错误码解释
+    '''
+
+    def HRIF_GetErrorCodeStr(self, boxID, nErrorCode, result):
+        command = 'GetErrorCodeStr,'
+        command += str(nErrorCode) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 13
     *	@param brief:读取控制器版本号
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -452,7 +683,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 12
+    *	@index : 14
     *	@param brief:读取机器人类型
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -590,6 +821,117 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    '''
+    *	@index : 9
+    *	@param brief:松闸
+    *	@param boxID:电箱ID
+    *	@param return: 错误码
+    *	@param nAxisID[0]: 轴ID
+    '''
+
+    def HRIF_OpenBrake(self, boxID, nAxisID):
+        result = []
+        command = 'OpenBrake,0,'
+        command += str(nAxisID)
+        command += ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 10
+    *	@param brief:抱闸
+    *	@param boxID:电箱ID
+    *	@param return: 错误码
+    *	@param nAxisID[0]: 轴ID
+    '''
+
+    def HRIF_CloseBrake(self, boxID, nAxisID):
+        result = []
+        command = 'CloseBrake,0,'
+        command += str(nAxisID)
+        command += ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 11
+    *	@param brief:读取各关节松/抱闸状态
+    *	@param boxID:电箱ID
+    *	@param return: 错误码
+    *	@param stateJ1-J6: 对应关节1~6的松/抱闸状态
+    '''
+
+    def HRIF_ReadBrakeStatus(self, boxID, result):
+        command = 'ReadBrakeStatus,0,;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 12
+    *	@param brief:移动到安全位置
+    *	@param boxID:电箱ID
+    *	@param return: 错误码
+    '''
+
+    def HRIF_MoveToSS(self, boxID):
+        result = []
+        command = 'MoveToSS,0,;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 13
+    *	@param brief:强制进入安全光幕
+    *	@param boxID:电箱ID
+    *	@param flag:状态标识   
+    *	@param return: 错误码
+    '''
+
+    def HRIF_EnterSafeGuard(self, boxID, rbtID, flag):
+        result = []
+        command = 'EnterSafetyGuard,'
+        command += str(rbtID) + ','
+        command += str(flag) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 14
+    *	@param brief:读取三段式使能开关与模式
+    *	@param boxID:电箱ID
+    *	@param result:三段式使能开关与模式   
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadTriStageSwitch(self, boxID, rbtID, result):
+        command = 'ReadTriStageSwitch,'
+        command += str(rbtID) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 15
+    *	@param brief:强制进入安全光幕
+    *	@param boxID:电箱ID
+    *	@param result:三段式使能开关与模式   
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetTriStageSwitch(self, boxID, rbtID, enable, mode):
+        result = []
+        command = 'SetTriStageSwitch,'
+        command += str(rbtID) + ','
+        command += str(enable) + ','
+        command += str(mode) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 16
+    *	@param brief:z轴对齐  
+    *	@param return: 错误码
+    '''
+
+    def HRIF_MoveAlignToZ(self, boxID, rbtID, tcp, ucs, result):
+        command = 'MoveAlignToZ,'
+        command += str(rbtID) + ','
+        command += str(tcp) + ','
+        command += str(ucs) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     #
     # part 3 脚本控制指令
     #
@@ -627,16 +969,13 @@ class CPSClient(object):
     '''
     *	@index : 3
     *	@param brief:停止运行脚本
-    *	@param rbtID:机器人ID,一般为0
     *	@param boxID:电箱ID
     *	@param return: 错误码
     '''
 
-    def HRIF_StopScript(self, boxID, rbtID):
+    def HRIF_StopScript(self, boxID):
         result = []
-        command = 'StopScript,'
-        command += str(rbtID) + ','
-        command += ';'
+        command = 'StopScript,;'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
@@ -663,6 +1002,36 @@ class CPSClient(object):
         command = 'ContinueScript,;'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    '''
+    *	@index : 6
+    *	@param brief:切换运行脚本
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID
+    *	@param name:脚本名
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SwitchScript(self, boxID, rbtID, name):
+        result = []
+        command = 'SwitchScript,'
+        command += str(rbtID) + ','
+        command += name +',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 7
+    *	@param brief:读取运行脚本
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID
+    *	@param result[0]:脚本名
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadDefaultScript(self, boxID, rbtID, result):
+        command = 'ReadDefaultScript,'
+        command += str(rbtID) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     #
     # part 4 电箱控制指令
     #
@@ -671,7 +1040,6 @@ class CPSClient(object):
     *	@index : 1
     *	@param brief:读取电箱信息
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param result[0] : 电箱连接状态
     *	@param result[1] : 48V电压状态
     *	@param result[2] : 48V输出电压值
@@ -681,10 +1049,8 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_ReadBoxInfo(self, boxID, rbtID, result):
-        command = 'ReadBoxInfo,'
-        command += str(rbtID) + ','
-        command += ';'
+    def HRIF_ReadBoxInfo(self, boxID, result):
+        command = 'ReadBoxInfo,;'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
@@ -706,7 +1072,7 @@ class CPSClient(object):
     *	@param boxID:电箱ID
     *	@param bit : 通用数字输入位
     *	@param result[0]: 通用数字输入状态
-    *	@param return: 错误码
+    *	@param return: 错误码 
     '''
 
     def HRIF_ReadBoxDI(self, boxID, bit, result):
@@ -844,6 +1210,27 @@ class CPSClient(object):
 
     '''
     *	@index : 13
+    *	@param brief:设置焊接模拟量输出电压
+    *	@param boxID:电箱ID
+    *	@param nState : 通道开关状态
+    *	@param nIndex : 电压模拟量通道
+    *	@param dInitAO : 初始化电压
+    *	@param dWeldingAO : 焊接电压
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetMoveParamsAO(self, boxID, nState, nIndex, dInitAO, dWeldingAO):
+        result = []
+        command = 'SetMoveParamsAO,0,'
+        command += str(nState) + ','
+        command += str(nIndex) + ','
+        command += str(dInitAO) + ','
+        command += str(dWeldingAO) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 14
     *	@param brief:读取末端数字输入状态
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -860,7 +1247,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 14
+    *	@index : 15
     *	@param brief:读取末端数字输出状态
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -877,7 +1264,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 15
+    *	@index : 16
     *	@param brief:读取末端模拟量输入状态
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -894,7 +1281,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 16
+    *	@index : 17
     *	@param brief:读取末端按键状态，根据搭载的末端类型，各状态表示含义会有区别
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -905,6 +1292,23 @@ class CPSClient(object):
     def HRIF_ReadEndBTN(self, boxID, rbtID, result):
         command = 'ReadEndBTN,'
         command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 18
+    *	@param brief:启用/禁用末端按键
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param state : 模块按钮状态
+    *	@param return: 错误码
+    '''
+
+    def HRIF_EnableEndBTN(self, boxID, rbtID, state):
+        result = []
+        command = 'EnableEndBTN,'
+        command += str(rbtID) + ','
+        command += str(state) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
@@ -939,7 +1343,7 @@ class CPSClient(object):
 
     def HRIF_SetToolMotion(self, boxID, rbtID, state):
         result = []
-        command = 'SetTCPMotion,'
+        command = 'SetToolMotion,'
         command += str(rbtID) + ','
         command += str(state) + ',;'
         return self.g_clients[boxID].sendAndRecv(command, result)
@@ -983,7 +1387,17 @@ class CPSClient(object):
         for i in range(len(Joint)):
             command += str(Joint[i]) + ','
         command += ';'
-        print(command)
+        # print(command)
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_SetJointMaxVel_nJ(self, boxID, rbtID, Joint):
+        result = []
+        command = 'SetJointMaxVel,'
+        command += str(rbtID) + ','
+        for i in range(len(Joint)):
+            command += str(Joint[i]) + ','
+        command += ';'
+        # print(command)
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
@@ -996,6 +1410,15 @@ class CPSClient(object):
     '''
 
     def HRIF_SetJointMaxAcc(self, boxID, rbtID, Joint):
+        result = []
+        command = 'SetJointMaxAcc,'
+        command += str(rbtID) + ','
+        for i in range(len(Joint)):
+            command += str(Joint[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_SetJointMaxAcc_nJ(self, boxID, rbtID, Joint):
         result = []
         command = 'SetJointMaxAcc,'
         command += str(rbtID) + ','
@@ -1078,6 +1501,17 @@ class CPSClient(object):
         command += ',;'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_SetMaxAcsRange_nJ(self, boxID, rbtID, pMax, pMin):
+        result = []
+        command = 'SetMaxAcsRange,'
+        command += str(rbtID) + ','
+        for i in range(0, len(pMax)):
+            command += str(pMax[i]) + ','
+        for i in range(0, len(pMin)):
+            command += str(pMin[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
     *	@index : 9
     *	@param brief:设置空间最大运动范围
@@ -1123,7 +1557,60 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 10
+       *	@index : 10
+       *	@param brief:设置安全风险等级
+       *	@param boxID:电箱ID
+       *	@param nSafeLevel : 安全风险等级
+       *	@param return: 错误码
+    '''
+
+    def HRIF_SetCollideLevel(self, boxID, nSafeLevel):
+        result = []
+        command = 'SetCollideLevel,0,' + str(nSafeLevel) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+       *	@index : 11
+       *	@param brief:读取末端最大负载
+       *	@param boxID:电箱ID
+       *	@param result : 最大负载
+       *	@param return: 错误码
+    '''
+
+    def HRIF_ReadMaxPayload(self, boxID, result):
+        command = 'ReadMaxPayload,0,;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+       *	@index : 12
+       *	@param brief:读取当前负载参数
+       *	@param boxID:电箱ID
+       *	@param result[0] : 质量
+       *	@param result[1-3] : 质心X,Y,Z方向偏移
+       *	@param return: 错误码
+    '''
+
+    def HRIF_ReadPayload(self, boxID, result):
+        command = 'ReadPayload,0,;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 13
+    *	@param brief:读取速度比
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param result[0]: 当前系统的速度比(0.01~1)
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadOverride(self, boxID, rbtID, result):
+        command = 'ReadOverride,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 14
     *	@param brief:读取关节最大运动速度
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -1137,8 +1624,14 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_ReadJointMaxVel_nJ(self, boxID, rbtID, result):
+        command = 'ReadJointMaxVel,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
-    *	@index : 11
+    *	@index : 15
     *	@param brief:读取关节最大运动加速度
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -1152,8 +1645,14 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_ReadJointMaxAcc_nJ(self, boxID, rbtID, result):
+        command = 'ReadJointMaxAcc,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
-    *	@index : 12
+    *	@index : 16
     *	@param brief:读取关节最大运动加加速度
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -1167,8 +1666,14 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_ReadJointMaxJerk_nJ(self, boxID, rbtID, result):
+        command = 'ReadJointMaxJerk,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
-    *	@index : 13
+    *	@index : 17
     *	@param brief:读取直线运动最大速度参数
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -1185,10 +1690,9 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 14
+    *	@index : 18
     *	@param brief:读取直线运动最大速度参数
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param result[0] : 急停错误
     *	@param result[1] : 急停信号
     *	@param result[2] : 安全光幕错误
@@ -1196,14 +1700,13 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_ReadEmergencyInfo(self, boxID, rbtID, result):
+    def HRIF_ReadEmergencyInfo(self, boxID, result):
         command = 'ReadEmergencyInfo,'
-        command += str(rbtID) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 15
+    *	@index : 19
     *	@param brief: 读取当前机器人状态标志
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -1230,7 +1733,106 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 16
+    *	@index : 20
+    *	@param brief:读取 WayPoint 当前运动 ID 号
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param result[0]:当前 ID
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadCurWaypointID(self, boxID, rbtID, result):
+        command = 'ReadCurWayPointID,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 21
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param brief:读取错误码
+    *	@param result[0-5] : 轴错误码
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadAxisErrorCode(self, boxID, rbtID, result):
+        command = 'ReadAxisErrorCode,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_ReadAxisErrorCode_nJ(self, boxID, rbtID, result):
+        command = 'ReadAxisErrorCode,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 22
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param brief:读取状态机状态
+    *	@param result[0] : 当前状态机状态,具体描述见接口说明文档
+    *	@param result[1] : 状态机描述
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadCurFSM(self, boxID, rbtID, result):
+        command = 'ReadCurFSM,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+      *	@index : 23
+      *	@param brief:根据点位名称读取点位信息
+      *	@param boxID:电箱ID
+      *	@param rbtID:机器人ID,一般为0
+      *	@param pointName:点位名称
+      *	@param result[0-5] : J1-J6 关节坐标
+      *	@param result[6-11] : X-Rz 笛卡尔坐标
+      *	@param result[12-17] : Tcp_X-Tcp_Rz 当前工具坐标
+      *	@param result[18-23] : Ucs_X-Ucs_Rz 当前用户坐标
+      *	@param return: 错误码
+    '''
+
+    def HRIF_ReadPointByName(self, boxID, rbtID, pointName, result):
+        command = 'ReadPointByName,'
+        command += str(rbtID) + ','
+        command += pointName + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_ReadPointByName_nJ(self, boxID, rbtID, pointName, result):
+        command = 'ReadPointByName,'
+        command += str(rbtID) + ','
+        command += pointName + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+      *	@index : 24
+      *	@param brief:读取状态机状态
+      *	@param boxID:电箱ID
+      *	@param rbtID:机器人ID,一般为0
+      *	@param result[0] : 当前状态机状态
+      *	@param return: 错误码
+    '''
+
+    def HRIF_ReadCurFSMFromCPS(self, boxID, rbtID, result):
+        command = 'ReadCurFSM,'
+        command += str(rbtID) + ','
+        command += ';'
+        nRet = self.g_clients[boxID].sendAndRecv(command, result)
+        if len(result) < 1:
+            return nRet
+        strRes = self.dic_FSM.get(int(result[0]))
+        result.append(strRes)
+        return nRet
+
+    '''
+    *	@index : 25
     *	@param brief: 读取当前机器人状态标志
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -1255,70 +1857,19 @@ class CPSClient(object):
         return DataRet
 
     '''
-    *	@index : 17
-    *	@param brief:读取 WayPoint 当前运动 ID 号
-    *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
-    *	@param result[0]:当前 ID
-    *	@param return: 错误码
-    '''
-
-    def HRIF_ReadCurWaypointID(self, boxID, rbtID, result):
-        command = 'ReadCurWayPointID,'
-        command += str(rbtID) + ','
-        command += ';'
-        return self.g_clients[boxID].sendAndRecv(command, result)
-
-    '''
-    *	@index : 18
-    *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
-    *	@param brief:读取错误码
-    *	@param result[0-5] : 轴错误码
-    *	@param return: 错误码
-    '''
-
-    def HRIF_ReadAxiserrorCode(self, boxID, rbtID, result):
-        command = 'ReadAxisErrorCode,'
-        command += str(rbtID) + ','
-        command += ';'
-        return self.g_clients[boxID].sendAndRecv(command, result)
-
-    '''
-    *	@index : 19
-    *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
-    *	@param brief:读取状态机状态
-    *	@param result[0] : 当前状态机状态,具体描述见接口说明文档
-    *	@param result[1] : 状态机描述
-    *	@param return: 错误码
-    '''
-
-    def HRIF_ReadCurFSM(self, boxID, rbtID, result):
-        command = 'ReadCurFSM,'
-        command += str(rbtID) + ','
-        command += ';'
-        return self.g_clients[boxID].sendAndRecv(command, result)
-
-    '''
-      *	@index : 20
-      *	@param brief:读取状态机状态
+      *	@index : 26
+      *	@param brief:读取系统中保存的点位名称列表
       *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
-      *	@param result[0] : 当前状态机状态
+      *	@param rbtID:机器人ID,一般为0
+      *	@param result:点位列表
       *	@param return: 错误码
     '''
 
-    def HRIF_ReadCurFSMFromCPS(self, boxID, rbtID, result):
-        command = 'ReadCurFSM,'
+    def HRIF_ReadPointList(self, boxID, rbtID, result):
+        command = 'ReadPointList,'
         command += str(rbtID) + ','
         command += ';'
-        nRet = self.g_clients[boxID].sendAndRecv(command, result)
-        if len(result) < 1:
-            return nRet
-        strRes = self.dic_FSM.get(int(result[0]))
-        result.append(strRes)
-        return nRet
+        return self.g_clients[boxID].sendAndRecv(command, result)
 
     #
     # part 6 位置,速度,电流读取指令
@@ -1336,14 +1887,13 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def getTCPPose(self, boxID=0, rbtID=0):
-        pose = []
-        self.HRIF_ReadActPos(boxID, rbtID, pose)
-        pose = [float(num) for num in pose]
-        pose = pose[6:12]
-        return pose
-
     def HRIF_ReadActPos(self, boxID, rbtID, result):
+        command = 'ReadActPos,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_ReadActPos_nJ(self, boxID, rbtID, result):
         command = 'ReadActPos,'
         command += str(rbtID) + ','
         command += ';'
@@ -1364,6 +1914,12 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_ReadCmdJointPos_nJ(self, boxID, rbtID, result):
+        command = 'ReadCmdPos,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
     *	@index : 3
     *	@param brief:读取关节实际位置
@@ -1374,6 +1930,12 @@ class CPSClient(object):
     '''
 
     def HRIF_ReadActJointPos(self, boxID, rbtID, result):
+        command = 'ReadActACS,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_ReadActJointPos_nJ(self, boxID, rbtID, result):
         command = 'ReadActACS,'
         command += str(rbtID) + ','
         command += ';'
@@ -1436,6 +1998,12 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_ReadCmdJointVel_nJ(self, boxID, rbtID, result):
+        command = 'ReadCmdJointVel,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
     *	@index : 7
     *	@param brief: 读取关节实际速度
@@ -1446,6 +2014,12 @@ class CPSClient(object):
     '''
 
     def HRIF_ReadActJointVel(self, boxID, rbtID, result):
+        command = 'ReadActJointVel,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_ReadActJointVel_nJ(self, boxID, rbtID, result):
         command = 'ReadActJointVel,'
         command += str(rbtID) + ','
         command += ';'
@@ -1496,6 +2070,12 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_ReadCmdJointCur_nJ(self, boxID, rbtID, result):
+        command = 'ReadCmdJointCur,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
     *	@index : 11
     *	@param brief: 读取关节实际电流
@@ -1506,6 +2086,12 @@ class CPSClient(object):
     '''
 
     def HRIF_ReadActJointCur(self, boxID, rbtID, result):
+        command = 'ReadActJointCur,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_ReadActJointCur_nJ(self, boxID, rbtID, result):
         command = 'ReadActJointCur,'
         command += str(rbtID) + ','
         command += ';'
@@ -1535,7 +2121,6 @@ class CPSClient(object):
     *	@index : 1
     *	@param brief: 四元素转欧拉角
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param dQuaW : W
     *	@param dQuaX : Xi
     *	@param dQuaY : Yj
@@ -1546,9 +2131,8 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_Quaternion2RPY(self, boxID, rbtID, dQuaW, dQuaX, dQuaY, dQuaZ, result):
-        command = 'Quaternion2RPY,'
-        command += str(rbtID) + ','
+    def HRIF_Quaternion2RPY(self, boxID, dQuaW, dQuaX, dQuaY, dQuaZ, result):
+        command = 'Quaternion2RPY,0,'
         command += str(dQuaW) + ','
         command += str(dQuaX) + ','
         command += str(dQuaY) + ','
@@ -1560,7 +2144,6 @@ class CPSClient(object):
     *	@index : 2
     *	@param brief: 欧拉角转四元素
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param Rx : 欧拉角 Rx
     *	@param Ry : 欧拉角 Ry
     *	@param Rz : 欧拉角 Rz
@@ -1571,9 +2154,8 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_RPY2Quaternion(self, boxID, rbtID, Rx, Ry, Rz, result):
-        command = 'RPY2Quaternion,'
-        command += str(rbtID) + ','
+    def HRIF_RPY2Quaternion(self, boxID, Rx, Ry, Rz, result):
+        command = 'RPY2Quaternion,0,'
         command += str(Rx) + ','
         command += str(Ry) + ','
         command += str(Rz) + ','
@@ -1607,6 +2189,20 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_GetInverseKin_nJ(self, boxID, rbtID, rawPCS, rawACS, tcp, ucs, result):
+        command = 'PCS2ACS,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(rawPCS[i]) + ','
+        for i in range(0, len(rawACS)):
+            command += str(rawACS[i]) + ','
+        for i in range(0, 6):
+            command += str(tcp[i]) + ','
+        for i in range(0, 6):
+            command += str(ucs[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
     *	@index : 4
     *	@param brief:正解，由关节坐标位置计算指定用户坐标系和工具坐标系下的迪卡尔坐标位置
@@ -1631,11 +2227,22 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_GetForwardKin_nJ(self, boxID, rbtID, rawACS, tcp, ucs, result):
+        command = 'ACS2PCS,'
+        command += str(rbtID) + ','
+        for i in range(0, len(rawACS)):
+            command += str(rawACS[i]) + ','
+        for i in range(0, 6):
+            command += str(tcp[i]) + ','
+        for i in range(0, 6):
+            command += str(ucs[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
     *	@index : 5
     *	@param brief:由基座坐标系下的坐标位置计算指定用户坐标系和工具坐标系下的迪卡尔坐标位置
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param Base : 基座坐标系下的迪卡尔坐标位置
     *	@param TCP : 工具坐标
     *	@param UCS : 用户坐标
@@ -1643,9 +2250,8 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_Base2UcsTcp(self, boxID, rbtID, Base, TCP, UCS, result):
-        command = 'Base2UcsTcp,'
-        command += str(rbtID) + ','
+    def HRIF_Base2UcsTcp(self, boxID, Base, TCP, UCS, result):
+        command = 'Base2UcsTcp,0,'
         for i in range(0, 6):
             command += str(Base[i]) + ','
         for i in range(0, 6):
@@ -1681,16 +2287,14 @@ class CPSClient(object):
     *	@index : 7
     *	@param brief:点位加法计算
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param pos1 : 空间坐标 1 
     *	@param pos2 : 空间坐标 2 
     *	@return result[0-5] : 计算结果
     *	@param return: 错误码
     '''
 
-    def HRIF_PoseAdd(self, boxID, rbtID, pos1, pos2, result):
-        command = 'PoseAdd,'
-        command += str(rbtID) + ','
+    def HRIF_PoseAdd(self, boxID, pos1, pos2, result):
+        command = 'PoseAdd,0,'
         for i in range(0, 6):
             command += str(pos1[i]) + ','
         for i in range(0, 6):
@@ -1702,16 +2306,14 @@ class CPSClient(object):
     *	@index : 8
     *	@param brief:点位减法计算
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param pos1 : 空间坐标 1 
     *	@param pos2 : 空间坐标 2 
     *	@return result[0-5] : 计算结果
     *	@param return: 错误码
     '''
 
-    def HRIF_PoseSub(self, boxID, rbtID, pos1, pos2, result):
-        command = 'PoseSub,'
-        command += str(rbtID) + ','
+    def HRIF_PoseSub(self, boxID, pos1, pos2, result):
+        command = 'PoseSub,0,'
         for i in range(0, 6):
             command += str(pos1[i]) + ','
         for i in range(0, 6):
@@ -1724,16 +2326,14 @@ class CPSClient(object):
     *	@param brief:坐标变换,
         组合运算 HRIF_PoseTrans(p1,HRIF_PoseInverse(p2))，得到的就是基坐标系下的 p1,在用户坐标系 p2 下的位置
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param pos1 : 空间坐标 1 
     *	@param pos2 : 空间坐标 2 
     *	@return result[0-5] : 计算结果
     *	@param return: 错误码
     '''
 
-    def HRIF_PoseTrans(self, boxID, rbtID, pos1, pos2, result):
-        command = 'PoseTrans,'
-        command += str(rbtID) + ','
+    def HRIF_PoseTrans(self, boxID, pos1, pos2, result):
+        command = 'PoseTrans,0,'
         for i in range(0, 6):
             command += str(pos1[i]) + ','
         for i in range(0, 6):
@@ -1745,15 +2345,13 @@ class CPSClient(object):
     *	@index : 10
     *	@param brief:坐标逆变换
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param pos1 : 空间坐标 1 
     *	@return result[0-5] : 计算结果
     *	@param return: 错误码
     '''
 
-    def HRIF_PoseInverse(self, boxID, rbtID, pos1, result):
-        command = 'PoseInverse,'
-        command += str(rbtID) + ','
+    def HRIF_PoseInverse(self, boxID, pos1, result):
+        command = 'PoseInverse,0,'
         for i in range(0, 6):
             command += str(pos1[i]) + ','
         command += ';'
@@ -1763,7 +2361,6 @@ class CPSClient(object):
     *	@index : 11
     *	@param brief:计算点位距离
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param pos1 : 空间坐标 1 
     *	@param pos1 : 空间坐标 2 
     *	@return result[0] : 点位距离 
@@ -1771,21 +2368,29 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_PoseDist(self, boxID, rbtID, pos1, pos2, result):
-        command = 'CalPointDistance,'
-        command += str(rbtID) + ','
+    def HRIF_PoseDist(self, boxID, pos1, pos2, result):
+        command = 'CalPointDistance,0,'
         for i in range(0, 6):
             command += str(pos1[i]) + ','
         for i in range(0, 6):
             command += str(pos2[i]) + ','
         command += ';'
-        return self.g_clients[boxID].sendAndRecv(command, result)
+        ret = self.g_clients[boxID].sendAndRecv(command, result)
+        # 检查result是否包含字符串，并将其转换为float
+        for i in range(len(result)):
+            if isinstance(result[i], str):
+                try:
+                    result[i] = float(result[i])
+                except ValueError:
+                    # 如果转换失败（例如，字符串不能转换为float），保持原值或进行错误处理
+                    pass
+
+        return ret
 
     '''
     *	@index : 12
     *	@param brief:空间位置直线插补计算
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param pos1 : 空间坐标 1
     *	@param pos2 : 空间坐标 2
     *	@param alpha : 插补比例 
@@ -1793,9 +2398,8 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_PoseInterpolate(self, boxID, rbtID, pos1, pos2, alpha, result):
-        command = 'PoseInterpolate,'
-        command += str(rbtID) + ','
+    def HRIF_PoseInterpolate(self, boxID, pos1, pos2, alpha, result):
+        command = 'PoseInterpolate,0,'
         for i in range(0, 6):
             command += str(pos1[i]) + ','
         for i in range(0, 6):
@@ -1808,7 +2412,6 @@ class CPSClient(object):
     *	@index : 13
     *	@param brief:以轨迹中心旋转计算，p1,p2,p3为旋转前选取的轨迹的特征点，p4,p5,p6为旋转后选取的轨迹的特征点，计算结果表示为旋转特征的用户坐标系
     *	@param boxID:电箱ID
-    *	@param rbtID:机器人ID,一般为0
     *	@param pose1 : 坐标1(X-Z)
     *	@param pose2 : 坐标2(X-Z)
     *	@param pose3 : 坐标1(X-Z)
@@ -1819,9 +2422,8 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_PoseDefdFrame(self, boxID, rbtID, pos1, pos2, pos3, pos4, pos5, pos6, result):
-        command = 'DefdFrame,'
-        command += str(rbtID) + ','
+    def HRIF_PoseDefdFrame(self, boxID, pos1, pos2, pos3, pos4, pos5, pos6, result):
+        command = 'PoseDefdFrame,0,'
         for i in range(0, 3):
             command += str(pos1[i]) + ','
         for i in range(0, 3):
@@ -1834,6 +2436,98 @@ class CPSClient(object):
             command += str(pos5[i]) + ','
         for i in range(0, 3):
             command += str(pos6[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 14
+    *	@param brief:通过三点平面法计算UCS
+    *	@param boxID:电箱ID
+    *	@param pos1 : 点1在Base坐标系下系统默认TCP的位置
+    *	@param pos2 : 点2在Base坐标系下系统默认TCP的位置
+    *	@param pos3 : 点3在Base坐标系下系统默认TCP的位置
+    *	@return result[0-5] : 计算坐标
+    *	@param return: 错误码
+    '''
+
+    def HRIF_CalUcsPlane(self, boxID, pos1, pos2, pos3, result):
+        command = 'CalUcsPlane,0,'
+        for i in range(0, 3):
+            command += str(pos1[i]) + ','
+        for i in range(0, 3):
+            command += str(pos2[i]) + ','
+        for i in range(0, 3):
+            command += str(pos3[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 15
+    *	@param brief:通过两点直线法计算UCS
+    *	@param boxID:电箱ID
+    *	@param pos1 : 点1在Base坐标系下系统默认TCP的位置
+    *	@param pos2 : 点2在Base坐标系下系统默认TCP的位置
+    *	@return result[0-5] : 计算坐标
+    *	@param return: 错误码
+    '''
+
+    def HRIF_CalUcsLine(self, boxID, pos1, pos2, result):
+        command = 'CalUcsLine,0,'
+        for i in range(0, 6):
+            command += str(pos1[i]) + ','
+        for i in range(0, 6):
+            command += str(pos2[i]) + ','
+
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 16
+    *	@param brief:通过三点平面法计算TCP
+    *	@param boxID:电箱ID
+    *	@param pos1 : 点1在Base坐标系下系统默认TCP的位姿
+    *	@param pos2 : 点2在Base坐标系下系统默认TCP的位姿
+    *	@param pos3 : 点3在Base坐标系下系统默认TCP的位姿
+    *	@return result[0-5] : 计算坐标
+    *	@return result[6] : 结果质量
+    *	@param return: 错误码
+    '''
+
+    def HRIF_CalTcp3P(self, boxID, pos1, pos2, pos3, result):
+        command = 'CalTcp3P,0,'
+        for i in range(0, 6):
+            command += str(pos1[i]) + ','
+        for i in range(0, 6):
+            command += str(pos2[i]) + ','
+        for i in range(0, 6):
+            command += str(pos3[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 17
+    *	@param brief:通过四点平面法计算TCP
+    *	@param boxID:电箱ID
+    *	@param pos1 : 点1在Base坐标系下系统默认TCP的位姿
+    *	@param pos2 : 点2在Base坐标系下系统默认TCP的位姿
+    *	@param pos3 : 点3在Base坐标系下系统默认TCP的位姿
+    *	@param pos4 : 点4在Base坐标系下系统默认TCP的位姿
+    *	@return result[0-5] : 计算坐标
+    *	@return result[6] : 结果质量
+    *	@return result[7-10] : 源点的错误指示
+    *	@param return: 错误码
+    '''
+
+    def HRIF_CalTcp4P(self, boxID, pos1, pos2, pos3, pos4, result):
+        command = 'CalTcp4P,0,'
+        for i in range(0, 6):
+            command += str(pos1[i]) + ','
+        for i in range(0, 6):
+            command += str(pos2[i]) + ','
+        for i in range(0, 6):
+            command += str(pos3[i]) + ','
+        for i in range(0, 6):
+            command += str(pos4[i]) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
@@ -1971,6 +2665,70 @@ class CPSClient(object):
         command += str(UCS) + ',;'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    '''
+    *	@index : 9
+    *	@param brief:新建指定名称的TCP和值
+    *	@param boxID:电箱ID
+    *	@param sTcpName: 工具坐标名称
+    *	@param dTcp_X-dTcp_Rz : 工具坐标
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ConfigTCP(self, boxID, name, pos):
+        result = []
+        command = 'ConfigTCP,0,'
+        command += name + ','
+        for i in range(0, 6):
+            command += str(pos[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 10
+    *	@param brief:新建指定名称的UCS和值
+    *	@param boxID:电箱ID
+    *	@param sUcsName: 工具坐标名称
+    *	@param dTcp_X-dTcp_Rz : 工具坐标
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ConfigUCS(self, boxID, name, pos):
+        result = []
+        command = 'ConfigUCS,0,'
+        command += name + ','
+        for i in range(0, 6):
+            command += str(pos[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 11
+    *	@param brief:读取系统中保存的 TCP名称列表
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param result: TCP名称列表
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadTCPList(self, boxID, rbtID, result):
+        command = 'ReadTCPList,'
+        command += str(rbtID) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 12
+    *	@param brief:读取系统中保存的 UCS名称列表
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param result: UCS名称列表
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadUCSList(self, boxID, rbtID, result):
+        command = 'ReadUCSList,'
+        command += str(rbtID) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     #
     # part 9 力控控制指令
     #
@@ -2019,7 +2777,8 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_SetForceToolCoordinateMotion(self, boxID, rbtID, mode, result):
+    def HRIF_SetForceToolCoordinateMotion(self, boxID, rbtID, mode):
+        result = []
         command = 'SetForceToolCoordinateMotion,'
         command += str(rbtID) + ','
         command += str(mode)
@@ -2241,16 +3000,18 @@ class CPSClient(object):
     *	@param brief:设置力控目标力
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
-    *	@param forcegoal:力控目标力
+    *	@param force_goal:力控目标力
     *	@param return: 错误码
     '''
 
-    def HRIF_SetForceControlGoal(self, boxID, rbtID, forcegoal):
+    def HRIF_SetForceControlGoal(self, boxID, rbtID, force_goal):
         result = []
         command = 'HRSetControlGoal,'
         command += str(rbtID) + ','
         for i in range(0, 6):
-            command += str(forcegoal[i]) + ','
+            command += str(force_goal[i]) + ','
+        for i in range(0, 6):
+            command += str(0) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
@@ -2326,17 +3087,46 @@ class CPSClient(object):
 
     def HRIF_SetForceFreeDriveMode(self, boxID, rbtID, state):
         result = []
-        command = ''
-        if state == 0:
-            command = 'GrpCloseFreeDriver,'
-        else:
-            command = 'GrpOpenFreeDriver,'
+        command = 'SetFTFreeDriveState,'
         command += str(rbtID) + ','
+        command += str(state) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
     *	@index : 20
+    *	@param brief:设置自由驱动的速度模式
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param nMode:速度模式，默认为0.0：正常速度模式 1：慢速模式 2：快速模式 3：焊接模式
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetFTFreeDriveSpeedMode(self, boxID, rbtID, mode):
+        result = []
+        command = 'SetFTFreeDriveSpeedMode,'
+        command += str(rbtID) + ','
+        command += str(mode) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 21
+    *	@param brief:读取设定后的自由驱动速度模式
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param result[0]:速度模式 0：正常速度模式 1：慢速模式 2：快速模式 3：焊接模式
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadFTFreeDriveSpeedMode(self, boxID, rbtID, result):
+        command = 'ReadFTFreeDriveSpeedMode,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 22
     *	@param brief:读取力控标定后数据
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -2356,7 +3146,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 21
+    *	@index : 23
     *	@param brief:读取力控原始数据
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -2376,7 +3166,41 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 22
+    *	@index : 24
+    *	@param brief:设置力控自由驱动末端自由度
+    *	@param boxID:电箱ID
+    *	@param df[0-5]:各方向自由度
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetFreeDriveMotionFreedom(self, boxID, df):
+        result = []
+        command = 'SetFTMotionFreedom,0,'
+        for i in range(0, 6):
+            command += str(df[i]) + ','
+        command += ';'
+        # print(command)
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 25
+    *	@param brief:设置平移柔顺度和旋转柔顺度
+    *	@param boxID:电箱ID
+    *	@param dLinear:平移柔顺度
+    *	@param dAngular:旋转柔顺度
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetFTFreeFactor(self, boxID, dLinear, dAngular):
+        result = []
+        command = 'SetFTFreeFactor,0,'
+        command += str(dLinear) + ','
+        command += str(dAngular) + ',;'
+
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 26
     *	@param brief:越障模式下,设置切向力判断的上下边界
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -2397,7 +3221,132 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 
+    *	@index : 27
+    *	@param brief:设置FreeDrive模式下的定向补偿力大小及矢量方向
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param dForce:补偿力大小
+    *	@param x-z:补偿力的矢量方向
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetFreeDriveCompensateForce(self, boxID, rbtID, force, x, y, z):
+        result = []
+        command = 'SetFreeDriveCompensateForce,'
+        command += str(rbtID) + ','
+        command += str(force) + ','
+        command += str(x) + ','
+        command += str(y) + ','
+        command += str(z) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 28
+    *	@param brief:设置力控自由驱动启动阈值（力与力矩）
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param ForceThreshold:自由驱动力启动阈值
+    *	@param TorqueThreshold:自由驱动力矩启动阈值
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetFTWrenchThresholds(self, boxID, rbtID, force, torque):
+        result = []
+        command = 'SetFTWrenchThresholds,'
+        command += str(rbtID) + ','
+        command += str(force) + ','
+        command += str(torque) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 29
+    *	@param brief:设置力控自由驱动最大直线速度及姿态角速度
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param vel:自由驱动的最大直线速度
+    *	@param angular_vel:自由驱动的最大姿态角速度
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetMaxFreeDriveVel(self, boxID, rbtID, vel, angular_vel):
+        result = []
+        command = 'SetMaxFreeDriveVel,'
+        command += str(rbtID) + ','
+        command += str(vel) + ','
+        command += str(angular_vel) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 30
+    *	@param brief:读取力控自由驱动的末端自由度
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param result[0-5]:各方向探寻自由度开关：0：关闭 1：开启
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadFTMotionFreedom(self, boxID, rbtID, result):
+        command = 'ReadFTMotionFreedom,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 31
+    *	@param brief: 设置各自由度力控探寻最大距离,>=1,单位:mm
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param AllowDistance1:x方向探寻最大距离
+    *	@param AllowDistance2:y方向探寻最大距离
+    *	@param AllowDistance3:z方向探寻最大距离
+    *	@param AllowDistance4:Rx方向探寻最大距离
+    *	@param AllowDistance5:Ry方向探寻最大距离
+    *	@param AllowDistance6:Rz方向探寻最大距离
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetMaxSearchDistance(self, boxID, rbtID, AllowDistance1, AllowDistance2, AllowDistance3, AllowDistance4,
+                                  AllowDistance5, AllowDistance6):
+        result = []
+        command = 'HRSetMaxSearchDistance,'
+        command += str(rbtID) + ','
+        command += str(AllowDistance1) + ','
+        command += str(AllowDistance2) + ','
+        command += str(AllowDistance3) + ','
+        command += str(AllowDistance4) + ','
+        command += str(AllowDistance5) + ','
+        command += str(AllowDistance6) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 32
+    *	@param brief: 设置力与力矩数据的均值滤波器
+    *	@param boxID: 电箱ID
+    *	@param rbtID: 机器人ID,一般为0
+    *	@param ForceState: 力数据均值滤波开关 0：关闭 1：开启
+    *	@param TorqueState: 力矩数据均值滤波开关 0：关闭 1：开启
+    *	@param ForceLength: 力值均值滤波长度
+    *	@param TorqueLength: 力矩均值滤波长度
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetFTMovingAvgFilterParams(self, boxID, rbtID, ForceState, TorqueState, ForceLength, TorqueLength):
+        result = []
+        command = 'HRSetFTMovingAvgFilterParams,'
+        command += str(rbtID) + ','
+        command += str(ForceState) + ','
+        command += str(TorqueState) + ','
+        command += str(ForceLength) + ','
+        command += str(TorqueLength) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 33
     *	@param brief:开启关闭力传感器_脚本带配置
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -2417,14 +3366,15 @@ class CPSClient(object):
     *	@param return: 是否开启力控成功(0成功，1失败)
     '''
 
-    def HRIF_SetScriptForceControlState(self, boxID, rbtID, state, FTMode, UCS, vel, forces, freedom, PID, Mass, Damp,
-                                        Stiff):
+    def HRIF_SetScriptForceControlState(self, boxID, rbtID, state, FTMode, UCS, TCP, vel, forces, freedom, PID, Mass,
+                                        Damp, Stiff):
         result = []
         command = 'SetScriptForceControlState,'
         command += str(rbtID) + ','
         command += str(state) + ','
         command += str(FTMode) + ','
         command += str(UCS) + ','
+        command += str(TCP) + ','
         for i in range(0, 2):
             command += str(vel[i]) + ','
         for i in range(0, 6):
@@ -2455,7 +3405,90 @@ class CPSClient(object):
                         time.sleep(0.2)
                         break
                 time.sleep(0.2)
-        return True
+        return retData
+
+    '''
+    *	@index : 34
+    *	@param brief: 设置恒力控稳定阶段边界
+    *	@param boxID: 电箱ID
+    *	@param rbtID: 机器人ID,一般为0
+    *	@param x-rz: 正方向边界（与探寻方向一致），单位：mm
+    *	@param nx-nrz: 负方向边界（与探寻方向相反），单位：mm
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetSteadyContactDeviationRange(self, boxID, rbtID, x, y, z, rx, ry, rz, nx, ny, nz, nrx, nry, nrz):
+        result = []
+        command = 'HRSetSteadyContactDeviationRange,'
+        command += str(rbtID) + ','
+        command += str(x) + ','
+        command += str(y) + ','
+        command += str(z) + ','
+        command += str(rx) + ','
+        command += str(ry) + ','
+        command += str(rz) + ','
+        command += str(nx) + ','
+        command += str(ny) + ','
+        command += str(nz) + ','
+        command += str(nrx) + ','
+        command += str(nry) + ','
+        command += str(nrz) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_SetDepthThresholdForDampingArea(self, boxID, rbtID, depth):
+        result = []
+        command = 'SetDepthThresholdForDampingArea,'
+        command += str(rbtID) + ','
+        command += str(depth) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_AddSafePlane(self, boxID, rbtID, name, UcsName, mode, display, switch):
+        result = []
+        command = 'AddSafePlane,'
+        command += str(rbtID) + ','
+        command += str(name) + ','
+        command += str(UcsName) + ','
+        command += str(mode) + ','
+        command += str(display) + ','
+        command += str(switch) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_UpdateSafePlane(self, boxID, rbtID, name, UcsName, mode, display, switch):
+        result = []
+        command = 'UpdateSafePlane,'
+        command += str(rbtID) + ','
+        command += name + ','
+        command += UcsName + ','
+        command += str(mode) + ','
+        command += str(display) + ','
+        command += str(switch) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_DelSafePlane(self, boxID, rbtID, name):
+        result = []
+        command = 'DelSafePlane,'
+        command += str(rbtID) + ','
+        command += name + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_ReadSafePlaneList(self, boxID, rbtID, result):
+        command = 'ReadSafePlane,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_ReadSafePlane(self, boxID, rbtID, name, result):
+        command = 'ReadSafePlane,'
+        command += str(rbtID) + ','
+        command += name + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
 
     #
     # part 10 通用运动类控制指令
@@ -2467,16 +3500,16 @@ class CPSClient(object):
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
     *	@param axisId: 关节轴 ID
-    *	@param derection: 运动方向(0:负,1:正)
+    *	@param direction: 运动方向(0:负,1:正)
     *	@param return: 错误码
     '''
 
-    def HRIF_ShortJogJ(self, boxID, rbtID, axisId, derection):
+    def HRIF_ShortJogJ(self, boxID, rbtID, axisId, direction):
         result = []
         command = 'ShortJogJ,'
         command += str(rbtID) + ','
         command += str(axisId) + ','
-        command += str(derection) + ','
+        command += str(direction) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
@@ -2486,16 +3519,16 @@ class CPSClient(object):
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
     *	@param pcsId: 坐标系轴 ID
-    *	@param derection: 运动方向(0:负,1:正)
+    *	@param direction: 运动方向(0:负,1:正)
     *	@param return: 错误码
     '''
 
-    def HRIF_ShortJogL(self, boxID, rbtID, pcsId, derection):
+    def HRIF_ShortJogL(self, boxID, rbtID, pcsId, direction):
         result = []
         command = 'ShortJogL,'
         command += str(rbtID) + ','
         command += str(pcsId) + ','
-        command += str(derection) + ','
+        command += str(direction) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
@@ -2505,17 +3538,17 @@ class CPSClient(object):
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
     *	@param axisId: 关节轴 ID
-    *	@param derection: 运动方向(0:负,1:正)
+    *	@param direction: 运动方向(0:负,1:正)
     *	@param state: 0:关闭,1:开启
     *	@param return: 错误码
     '''
 
-    def HRIF_LongJogJ(self, boxID, rbtID, axisId, derection, state):
+    def HRIF_LongJogJ(self, boxID, rbtID, axisId, direction, state):
         result = []
         command = 'LongJogJ,'
         command += str(rbtID) + ','
         command += str(axisId) + ','
-        command += str(derection) + ','
+        command += str(direction) + ','
         command += str(state) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
@@ -2526,22 +3559,23 @@ class CPSClient(object):
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
     *	@param pcsId: 坐标系轴 ID
-    *	@param derection: 运动方向(0:负,1:正)
+    *	@param direction: 运动方向(0:负,1:正)
     *	@param state: 0:关闭,1:开启
     *	@param return: 错误码
     '''
 
-    def HRIF_LongJogL(self, boxID, rbtID, pcsId, derection, state):
+    def HRIF_LongJogL(self, boxID, rbtID, pcsId, direction, state):
         result = []
         command = 'LongJogL,'
         command += str(rbtID) + ','
         command += str(pcsId) + ','
-        command += str(derection) + ','
+        command += str(direction) + ','
         command += str(state) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
-    ''' 
+
+    '''
     *	@index : 5
     *	@param brief:长点动继续指令，当开始长点动之后，要按 500 毫秒或更短时间为时间周期发送一次该指令，否则长点动会停止
     *	@param boxID:电箱ID
@@ -2566,6 +3600,7 @@ class CPSClient(object):
     '''
 
     def HRIF_IsMotionDone(self, boxID, rbtID, result):
+        result.clear()
         ret = []
         errorCode = self.HRIF_ReadRobotState(boxID, rbtID, ret)
         if errorCode != 0:
@@ -2584,11 +3619,19 @@ class CPSClient(object):
 
     def HRIF_IsBlendingDone(self, boxID, rbtID, result):
         ret = []
-        errorCode = self.HRIF_ReadRobotState(boxID, rbtID, ret)
-        if errorCode != 0:
-            return errorCode
-        result.append(ret[11])
-        return errorCode
+        command = 'ReadRobotState,'
+        command += str(rbtID) + ','
+        command += ';'
+        net = self.g_clients[boxID].sendAndRecv(command, ret)
+        if net != 0:
+            return net
+        if (ret[1] == 0 and ret[2] == 1 and ret[7] == 1 and ret[8] == 1 and ret[9] == 0 and ret[10] == 0):
+            return 20018
+        if (int(ret[11]) == 1):
+            result.append(True)
+        else:
+            result.append(False)
+        return net
 
     '''
     *	@index : 8
@@ -2617,6 +3660,31 @@ class CPSClient(object):
         for i in range(0, 6):
             command += str(points[i]) + ','
         for i in range(0, 6):
+            command += str(RawACSpoints[i]) + ','
+        for i in range(0, 6):
+            command += str(ucs[i]) + ','
+        for i in range(0, 6):
+            command += str(tcp[i]) + ','
+        command += str(speed) + ','
+        command += str(acc) + ','
+        command += str(radius) + ','
+        command += str(type) + ','
+        command += str(isJoint) + ','
+        command += str(isSeek) + ','
+        command += str(bit) + ','
+        command += str(state) + ','
+        command += cmdID + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_WayPointEx_nJ(self, boxID, rbtID, type, points, RawACSpoints, tcp, ucs, speed, acc, radius, isJoint, isSeek,
+                        bit, state, cmdID):
+        result = []
+        command = 'WayPointEx,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(points[i]) + ','
+        for i in range(0, len(RawACSpoints)):
             command += str(RawACSpoints[i]) + ','
         for i in range(0, 6):
             command += str(ucs[i]) + ','
@@ -2676,6 +3744,29 @@ class CPSClient(object):
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_WayPoint_nJ(self, boxID, rbtID, type, points, RawACSpoints, tcp, ucs, speed, Acc, radius, isJoint, isSeek,
+                      bit, state, cmdID):
+        result = []
+        command = 'WayPoint,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(points[i]) + ','
+        for i in range(0, len(RawACSpoints)):
+            command += str(RawACSpoints[i]) + ','
+        command += str(tcp) + ','
+        command += str(ucs) + ','
+        command += str(speed) + ','
+        command += str(Acc) + ','
+        command += str(radius) + ','
+        command += str(type) + ','
+        command += str(isJoint) + ','
+        command += str(isSeek) + ','
+        command += str(bit) + ','
+        command += str(state) + ','
+        command += str(cmdID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
     '''
     *	@index : 10
     *	@param brief:路点运动(HRIF_WayPoint2 新增直线与圆弧过渡不减速功能，HRIF_WayPoint 只有直线与直线之间有过渡)
@@ -2700,18 +3791,17 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_WayPoint2(self, boxID, rbtID, EndPos, AuxPos, cmdID, Tcp, Ucs, Vel, Acc, Radius, type, isJoint, isSeek,
-                       bit, state, AcsPos):
+    def HRIF_WayPoint2(self, boxID, rbtID, type, EndPos, AuxPos, AcsPos, Tcp, Ucs, Vel, Acc, Radius, isJoint, isSeek,
+                       bit, state, cmdID):
         result = []
         command = 'WayPoint2,'
         command += str(rbtID) + ','
         for i in range(0, 6):
             command += str(EndPos[i]) + ','
         for i in range(0, 6):
-            command += str(AuxPos[i]) + ','
-        command += str(cmdID) + ','
-        command += str(Tcp) + ','
-        command += str(Ucs) + ','
+            command += str(AcsPos[i]) + ','
+        command += Tcp + ','
+        command += Ucs + ','
         command += str(Vel) + ','
         command += str(Acc) + ','
         command += str(Radius) + ','
@@ -2721,8 +3811,32 @@ class CPSClient(object):
         command += str(bit) + ','
         command += str(state) + ','
         for i in range(0, 6):
+            command += str(AuxPos[i]) + ','
+        command += cmdID + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_WayPoint2_nJ(self, boxID, rbtID, type, EndPos, AuxPos, AcsPos, Tcp, Ucs, Vel, Acc, Radius, isJoint, isSeek,
+                       bit, state, cmdID):
+        result = []
+        command = 'WayPoint2,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(EndPos[i]) + ','
+        for i in range(0, len(AcsPos)):
             command += str(AcsPos[i]) + ','
-        command += ';'
+        command += Tcp + ','
+        command += Ucs + ','
+        command += str(Vel) + ','
+        command += str(Acc) + ','
+        command += str(Radius) + ','
+        command += str(type) + ','
+        command += str(isJoint) + ','
+        command += str(isSeek) + ','
+        command += str(bit) + ','
+        command += str(state) + ','
+        for i in range(0, 6):
+            command += str(AuxPos[i]) + ','
+        command += cmdID + ',;'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
@@ -2743,54 +3857,6 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def moveByJoint(self, target_joint, boxID=0, rbtID=0, speed=30, acceleration=50, radius=0, isJoint=1):
-        """
-        通过关节插补方式移动机器人到目标位姿。
-
-        参数:
-            target_joint (list): 目标位姿，包含6个关节值。
-            boxID (int): 盒子ID，默认值为0。
-            rbtID (int): 机器人ID，默认值为0。
-            speed (int): 移动速度，默认值为50。
-            acceleration (int): 加速度，默认值为500。
-            radius (int): 路径半径，默认值为0。
-            isJoint (int): 是否为关节插补，默认值为1（关节插补）。
-
-        返回:
-            None
-        """
-        ucs = "Base"  # 坐标系
-        ret = self.HRIF_MoveJ(
-            boxID=boxID,
-            rbtID=rbtID,
-            points=[0, 0, 0, 0, 0, 0],
-            RawACSpoints=target_joint,
-            tcp='TCP',
-            ucs=ucs,
-            speed=speed,
-            Acc=acceleration,
-            radius=radius,
-            isJoint=isJoint,
-            isSeek=0,
-            bit=0,
-            state=0,
-            cmdID=1
-        )
-
-        if ret == 0:
-            # 等待运动完成
-            while True:
-                motion_done_result = []
-                motion_done = self.HRIF_IsMotionDone(boxID, rbtID, motion_done_result)
-                if motion_done == 0 and motion_done_result and motion_done_result[0] == 1:
-                    break  # 运动完成
-                elif motion_done < 0:
-                    print(f"运动过程中出错，错误码: {motion_done}")
-                    break
-                time.sleep(0.5)  # 等待一段时间再次检查
-        else:
-            print(f"机器人运动失败，错误码: {ret}")
-
     def HRIF_MoveJ(self, boxID, rbtID, points, RawACSpoints, tcp, ucs, speed, Acc, radius, isJoint, isSeek, bit, state,
                    cmdID):
         result = []
@@ -2799,6 +3865,29 @@ class CPSClient(object):
         for i in range(0, 6):
             command += str(points[i]) + ','
         for i in range(0, 6):
+            command += str(RawACSpoints[i]) + ','
+        command += str(tcp) + ','
+        command += str(ucs) + ','
+        command += str(speed) + ','
+        command += str(Acc) + ','
+        command += str(radius) + ','
+        command += '0,'
+        command += str(isJoint) + ','
+        command += str(isSeek) + ','
+        command += str(bit) + ','
+        command += str(state) + ','
+        command += str(cmdID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_MoveJ_nJ(self, boxID, rbtID, points, RawACSpoints, tcp, ucs, speed, Acc, radius, isJoint, isSeek, bit, state,
+                   cmdID):
+        result = []
+        command = 'WayPoint,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(points[i]) + ','
+        for i in range(0, len(RawACSpoints)):
             command += str(RawACSpoints[i]) + ','
         command += str(tcp) + ','
         command += str(ucs) + ','
@@ -2831,25 +3920,6 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def move_robot(self, target_pose, boxID=0, rbtID=0, speed=100, acceleration=500, radius=0):
-        ucs = "Base"  # 坐标系
-        ret = self.HRIF_MoveL(boxID, rbtID, points=target_pose, RawACSpoints=target_pose, tcp="TCP", ucs=ucs,
-                              speed=speed, Acc=acceleration, radius=radius, isSeek=0, bit=0, state=1, cmdID=1)
-        if ret == 0:
-            # 等待运动完成
-            while True:
-                motion_done_result = []
-                motion_done = self.HRIF_IsMotionDone(boxID, rbtID, motion_done_result)
-                if motion_done == 0 and motion_done_result and motion_done_result[0] == 1:
-                    break  # 运动完成
-                elif motion_done < 0:
-                    print(f"运动过程中出错，错误码: {motion_done}")
-                    break
-                time.sleep(0.5)  # 等待一段时间再次检查
-        else:
-            print(f"机器人运动失败，错误码: {ret}")
-        return ret
-
     def HRIF_MoveL(self, boxID, rbtID, points, RawACSpoints, tcp, ucs, speed, Acc, radius, isSeek, bit, state, cmdID):
         result = []
         command = 'WayPoint,'
@@ -2857,6 +3927,28 @@ class CPSClient(object):
         for i in range(0, 6):
             command += str(points[i]) + ','
         for i in range(0, 6):
+            command += str(RawACSpoints[i]) + ','
+        command += str(tcp) + ','
+        command += str(ucs) + ','
+        command += str(speed) + ','
+        command += str(Acc) + ','
+        command += str(radius) + ','
+        command += '1,'
+        command += '0,'
+        command += str(isSeek) + ','
+        command += str(bit) + ','
+        command += str(state) + ','
+        command += str(cmdID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_MoveL_nJ(self, boxID, rbtID, points, RawACSpoints, tcp, ucs, speed, Acc, radius, isSeek, bit, state, cmdID):
+        result = []
+        command = 'WayPoint,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(points[i]) + ','
+        for i in range(0, len(RawACSpoints)):
             command += str(RawACSpoints[i]) + ','
         command += str(tcp) + ','
         command += str(ucs) + ','
@@ -2881,9 +3973,9 @@ class CPSClient(object):
     *	@param AuxPoint : 圆弧经过位置
     *	@param EndPoint : 圆弧结束位置
     *	@param fixedPosure : 0:不使用固定姿态,1:使用固定姿态
-    *	@param nMoveCType : 0:圆弧运动,1:整圆运动
-    *	@param nRadLen : 当nMoveCType=0时该参数无效,由三个点确定圆弧轨迹
-                         当nMoveCType=1时,该参数为整圆的圈数
+    *	@param nMoveCType : 1:圆弧运动,0:整圆运动
+    *	@param nRadLen : 当nMoveCType=1时该参数无效,由三个点确定圆弧轨迹
+                         当nMoveCType=0时,该参数为整圆的圈数
     *	@param speed : 运动速度,速度单位是毫米每秒,度每秒,加速度毫米每秒平方,度每秒平方
     *	@param Acc : 运动加速度,速度单位是毫米每秒,度每秒,加速度毫米每秒平方,度每秒平方
     *	@param radius : 是过渡半径,单位毫米
@@ -2904,6 +3996,32 @@ class CPSClient(object):
             command += str(AuxPoint[i]) + ','
         for i in range(0, 6):
             command += str(EndPoint[i]) + ','
+        command += str(fixedPosure) + ','
+        command += str(nMoveCType) + ','
+        command += str(nRadLen) + ','
+        command += str(speed) + ','
+        command += str(Acc) + ','
+        command += str(radius) + ','
+        command += str(tcp) + ','
+        command += str(ucs) + ','
+        command += str(cmdID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_MoveC_nJ(self, boxID, rbtID, StartPoint, AuxPoint, EndPoint, joint, IsUseCurRefAC, fixedPosure, nMoveCType,
+                      nRadLen, speed, Acc, radius, tcp, ucs, cmdID):
+        result = []
+        command = 'MoveC,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(StartPoint[i]) + ','
+        for i in range(0, 6):
+            command += str(AuxPoint[i]) + ','
+        for i in range(0, 6):
+            command += str(EndPoint[i]) + ','
+        for i in range(0, len(joint)):
+            command += str(joint[i]) + ','
+        command += str(IsUseCurRefAC) + ','
         command += str(fixedPosure) + ','
         command += str(nMoveCType) + ','
         command += str(nRadLen) + ','
@@ -3088,7 +4206,7 @@ class CPSClient(object):
         command += str(dDistance) + ','
         command += str(nToolMotion) + ','
         command += ';'
-        print(command)
+        # print(command)
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
@@ -3122,15 +4240,21 @@ class CPSClient(object):
         command += str(rbtID) + ','
         command += str(nType) + ','
         command += str(nPointList) + ','
+
         for i in range(0, 6):
             command += str(Pos[i]) + ','
+
         for i in range(0, 6):
             command += str(rawACT[i]) + ','
+
         command += str(nrelMoveType) + ','
+
         for i in range(0, 6):
             command += str(nAxisMask[i]) + ','
+
         for i in range(0, 6):
             command += str(dTarget[i]) + ','
+
         command += str(sTcpName) + ','
         command += str(sUcsName) + ','
         command += str(dVelocity) + ','
@@ -3141,12 +4265,216 @@ class CPSClient(object):
         command += str(nIOBit) + ','
         command += str(nIOState) + ','
         command += str(strcmdID) + ',;'
-        print(command)
+        # print(command)
         return self.g_clients[boxID].sendAndRecv(command, result)
 
+    def HRIF_WayPointRel_nJ(self, boxID, rbtID, nType, nPointList, Pos, rawACT, nrelMoveType, nAxisMask, dTarget, sTcpName,
+                         sUcsName, dVelocity, dAcc, dRadius, nIsUseJoint, nIsSeek, nIOBit, nIOState, strcmdID):
+        result = []
+        command = 'WayPointRel,'
+        command += str(rbtID) + ','
+        command += str(nType) + ','
+        command += str(nPointList) + ','
+
+        for i in range(0, 6):
+            command += str(Pos[i]) + ','
+
+        for i in range(0, len(rawACT)):
+            command += str(rawACT[i]) + ','
+
+        command += str(nrelMoveType) + ','
+
+        for i in range(0, 6):
+            command += str(nAxisMask[i]) + ','
+
+        for i in range(0, 6):
+            command += str(dTarget[i]) + ','
+
+        command += str(sTcpName) + ','
+        command += str(sUcsName) + ','
+        command += str(dVelocity) + ','
+        command += str(dAcc) + ','
+        command += str(dRadius) + ','
+        command += str(nIsUseJoint) + ','
+        command += str(nIsSeek) + ','
+        command += str(nIOBit) + ','
+        command += str(nIOState) + ','
+        command += str(strcmdID) + ',;'
+        # print(command)
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_CheckTemperatureUnderLow(self, boxID, rbtID, result):
+        command = 'CheckTemperatureUnderLow,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 20
+    *	@brief: 直线摆焊运动
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param StartPoint : 开始点位置
+    *	@param EndPoint : 结束点位置
+    *	@param dVelocity : 运动速度，单位是毫米每秒
+    *	@param Acc : 运动加速度，毫米每秒平方
+    *	@param dRadius : 过渡半径，单位毫米
+    *	@param dAmplitude : 宽度，摆焊的幅值，单位:mm
+    *	@param dIntervalDistance :摆焊的间距，此值仅供参考，机器人系统会自动微调该值以确保运
+    *                             动轨迹经过若干个完整周期的摆动后能通过起始点和结束点，单位:mm
+
+    *	@param nWeaveFrameType : 用于决定摆焊平面和摆焊方向的选择方式
+    *                           0：摆焊平面的+X方向为从StartPos到EndPos，+Z方向（即摆焊平面的法线方向）为跟刀具坐标系的+Z相同的方向，+Y方向由右手定则确定。摆焊启动时的运动方向跟+Y方向同侧。
+    *                           1：摆焊平面的+X方向为从StartPos到EndPos，Z方向跟刀具坐标系的Z方向平行，+Y方向跟刀具坐标系的+Y方向同侧。摆焊启动时的运动方向跟+Y方向同侧。    
+    *	@param dElevation : 摆焊的仰角，单位:度
+    *	@param dAzimuth : 摆焊的方向角，即绕摆焊平面法向量的旋转角，单位:度
+    *	@param dCentreRise : 摆焊的中心隆起量，即摆焊中心处焊炬的隆起量，单位:mm
+    *   @param nEnableWaiTime : 是否开启转折点等待时间(0:不使用，1:使用)
+    *	@param nPosiTime : 正向转折点等待时间ms
+    *	@param nNegaTime : 负向转折点等待时间ms
+    *	@param sTcpName : TCP name / 刀具坐标名称
+    *	@param sUcsName : UCS name / 用户坐标名称
+    *	@param sCmdID : 命令ID
+    *	@param return: 错误码
+    '''
+
+    def HRIF_MoveLinearWeave(self, boxID, rbtID, StartPoint, EndPoint, dVelocity, Acc, dRadius, dAmplitude,
+                             dIntervalDistance, nWeaveFrameType,
+                             dElevation, dAzimuth, dCentreRise, nEnableWaiTime, nPosiTime, nNegaTime, sTcpName,
+                             sUcsName, sCmdID, result):
+        command = 'MoveLinearWeave,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(StartPoint[i]) + ','
+        for i in range(0, 6):
+            command += str(EndPoint[i]) + ','
+        command += str(dVelocity) + ','
+        command += str(Acc) + ','
+        command += str(dRadius) + ','
+        command += str(dAmplitude) + ','
+        command += str(dIntervalDistance) + ','
+        command += str(nWeaveFrameType) + ','
+        command += str(dElevation) + ','
+        command += str(dAzimuth) + ','
+        command += str(dCentreRise) + ','
+        command += str(nEnableWaiTime) + ','
+        command += str(nPosiTime) + ','
+        command += str(nNegaTime) + ','
+        command += str(sTcpName) + ','
+        command += str(sUcsName) + ','
+        command += str(sCmdID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 21
+    *	@brief: 圆弧摆焊运动
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param StartPoint : 开始点位置
+    *	@param AuxPoint : 经过点位置    
+    *	@param EndPoint : 结束点位置
+    *	@param dVelocity : 运动速度，单位是毫米每秒
+    *	@param Acc : 运动加速度，毫米每秒平方
+    *	@param dRadius : 过渡半径，单位毫米
+    *	@param nOrientMode : 0:不使用固定姿态，1:使用固定姿态
+    *	@param nMoveWhole : 0:整圆轨迹，1:圆弧轨迹，
+    *	@param dMoveWholeLen : 当使用圆弧运动时该参数无效，通过计算三个点位来确定圆弧路径及弧度；当使用整圆运动时表示整圆的圈数
+    *	@param dAmplitude : 宽度，摆焊的幅值，单位:mm
+    *	@param dIntervalDistance :摆焊的间距，此值仅供参考，机器人系统会自动微调该值以确保运
+    *                             动轨迹经过若干个完整周期的摆动后能通过起始点和结束点，单位:mm
+
+    *	@param nWeaveFrameType : 用于决定摆焊平面和摆焊方向的选择方式
+    *                           0：摆焊平面的+X方向为从StartPos到EndPos，+Z方向（即摆焊平面的法线方向）为跟刀具坐标系的+Z相同的方向，+Y方向由右手定则确定。摆焊启动时的运动方向跟+Y方向同侧。
+    *                           1：摆焊平面的+X方向为从StartPos到EndPos，Z方向跟刀具坐标系的Z方向平行，+Y方向跟刀具坐标系的+Y方向同侧。摆焊启动时的运动方向跟+Y方向同侧。    
+    *	@param dElevation : 摆焊的仰角，单位:度
+    *	@param dAzimuth : 摆焊的方向角，即绕摆焊平面法向量的旋转角，单位:度
+    *	@param dCentreRise : 摆焊的中心隆起量，即摆焊中心处焊炬的隆起量，单位:mm
+    *   @param nEnableWaiTime : 是否开启转折点等待时间(0:不使用，1:使用)
+    *	@param nPosiTime : 正向转折点等待时间ms
+    *	@param nNegaTime : 负向转折点等待时间ms
+    *	@param sTcpName : TCP name / 刀具坐标名称
+    *	@param sUcsName : UCS name / 用户坐标名称
+    *	@param sCmdID : 命令ID
+    *	@param return: 错误码
+    '''
+
+    def HRIF_MoveCircularWeave(self, boxID, rbtID, StartPoint, AuxPoint, EndPoint, dVelocity, Acc, dRadius, nOrientMode,
+                               nMoveWhole, dMoveWholeLen, dAmplitude, dIntervalDistance, nWeaveFrameType,
+                               dElevation, dAzimuth, dCentreRise, nEnableWaiTime, nPosiTime, nNegaTime, sTcpName,
+                               sUcsName, sCmdID, result):
+        command = 'MoveCircularWeave,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(StartPoint[i]) + ','
+        for i in range(0, 6):
+            command += str(AuxPoint[i]) + ','
+        for i in range(0, 6):
+            command += str(EndPoint[i]) + ','
+        command += str(dVelocity) + ','
+        command += str(Acc) + ','
+        command += str(dRadius) + ','
+        command += str(nOrientMode) + ','
+        command += str(nMoveWhole) + ','
+        command += str(dMoveWholeLen) + ','
+        command += str(dAmplitude) + ','
+        command += str(dIntervalDistance) + ','
+        command += str(nWeaveFrameType) + ','
+        command += str(dElevation) + ','
+        command += str(dAzimuth) + ','
+        command += str(dCentreRise) + ','
+        command += str(nEnableWaiTime) + ','
+        command += str(nPosiTime) + ','
+        command += str(nNegaTime) + ','
+        command += str(sTcpName) + ','
+        command += str(sUcsName) + ','
+        command += str(sCmdID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    #
     # part 11 连续轨迹运动类控制指令
     #
 
+    def HRIF_MovePathJOL(self, boxID, rbtID, dVel, dAcc, dTol, RawACSpoints, nIsSetIO, nEndDOMask, nEndDOVal,
+                         nBoxDOMask, nBoxDOVal, nBoxCOMask, nBoxCOVal, nBoxAOCH0_Mask, nBoxAOCH0_Mode, nBoxAOCH1_Mask,
+                         nBoxAOCH1_Mode, dbBoxAOCH0_Val, dbBoxAOCH1_Val):
+        result = []
+        command = 'MovePathJOL,'
+        command += str(rbtID) + ','
+        command += str(dVel) + ','
+        command += str(dAcc) + ','
+        command += str(dTol) + ','
+        for i in range(0, len(nIsSetIO)):
+            for j in range(6*i, 6*i+6):
+                command += str(RawACSpoints[j]) + ','
+            command += str(nIsSetIO[i]) + ','
+            command += str(nEndDOMask[i]) + ','
+            command += str(nEndDOVal[i]) + ','
+            command += str(nBoxDOMask[i]) + ','
+            command += str(nBoxDOVal[i]) + ','
+            command += str(nBoxCOMask[i]) + ','
+            command += str(nBoxCOVal[i]) + ','
+            command += str(nBoxAOCH0_Mask[i]) + ','
+            command += str(nBoxAOCH0_Mode[i]) + ','
+            command += str(nBoxAOCH1_Mask[i]) + ','
+            command += str(nBoxAOCH1_Mode[i]) + ','
+            command += str(dbBoxAOCH0_Val[i]) + ','
+            command += str(dbBoxAOCH1_Val[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    def HRIF_GetMovePathJOLIndex(self, rbtID, boxID, result):
+        command = 'GetMovePathJOLIndex,'
+        command += str(rbtID) + ','
+        command += ';'
+        # print(command)
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+
+
+
+    ################################################################
     '''
     *	@index : 1
     *	@param brief:初始化关节连续轨迹运动
@@ -3166,7 +4494,7 @@ class CPSClient(object):
         command += str(speedRatio) + ','
         command += str(radius) + ','
         command += ';'
-        print(command)
+        # print(command)
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
@@ -3192,8 +4520,7 @@ class CPSClient(object):
 
     '''
     *	@index : 3
-    *	@param brief:轨迹下发完成,开始计算轨迹
-			调用pushMovePathJ,一般情况下点位数量需要>4
+    *	@param brief:轨迹下发完成,开始计算轨迹,调用pushMovePathJ,一般情况下点位数量需要>4
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
     *	@param trackName : 轨迹名称
@@ -3210,23 +4537,56 @@ class CPSClient(object):
 
     '''
     *	@index : 4
-    *	@param brief:执行轨迹运动
+    *	@param brief:轨迹下发完成,开始计算轨迹,调用pushMovePath,一般情况下点位数量需要>4
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
     *	@param trackName : 轨迹名称
     *	@param return: 错误码
     '''
 
-    def HRIF_MovePathJ(self, boxID, rbtID, trajectName):
+    def HRIF_EndPushMovePath(self, boxID, rbtID, trackName):
         result = []
-        command = 'MovePath,'
+        command = 'EndPushMovePath,'
         command += str(rbtID) + ','
-        command += str(trajectName) + ','
+        command += trackName + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    # '''
+    # *	@index : 5
+    # *	@param brief:执行轨迹运动
+    # *	@param boxID:电箱ID
+    # *	@param rbtID:机器人ID,一般为0
+    # *	@param trackName : 轨迹名称
+    # *	@param return: 错误码
+    # '''
+    # def HRIF_MovePath(self,boxID,rbtID,trajectName):
+    #     result = []
+    #     command = 'MovePath,'
+    #     command += str(rbtID) + ','
+    #     command += str(trajectName) + ','
+    #     command += ';'
+    #     return self.g_clients[boxID].sendAndRecv(command,result)
+
+    '''
+    *	@index : 5
+    *	@param brief:以关节运动的方式运行指定的轨迹
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param sPathName : 轨迹名称
+    *	@param return: 错误码
+    '''
+
+    def HRIF_MovePathJ(self, boxID, rbtID, sPathName):
+        result = []
+        command = 'MovePathJ,'
+        command += str(rbtID) + ','
+        command += str(sPathName) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 5
+    *	@index : 6
     *	@param brief:读取当前的轨迹状态
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3250,7 +4610,7 @@ class CPSClient(object):
         return retData
 
     '''
-    *	@index : 6
+    *	@index : 7
     *	@param brief:修改轨迹名称
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3269,7 +4629,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 7
+    *	@index : 8
     *	@param brief:删除指定轨迹
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3286,7 +4646,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 8
+    *	@index : 9
     *	@param brief:读取当前的轨迹运动进度(此接口仅对MovePathL有效，对MovePathJ无效)
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3303,7 +4663,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 9
+    *	@index : 10
     *	@param brief:初始化空间轨迹运动
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3327,11 +4687,11 @@ class CPSClient(object):
         command += ucs + ','
         command += tcp + ','
         command += ';'
-        print(command)
+        # print(command)
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 10
+    *	@index : 11
     *	@param brief:下发轨迹点位
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3351,7 +4711,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 11
+    *	@index : 12
     *	@param brief:批量下发轨迹点位，调用一次可下发多个点位数据
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3378,24 +4738,24 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 12
-    *	@param brief:执行空间坐标轨迹运动
+    *	@index : 13
+    *	@param brief:以直线运动的方式运行指定的轨迹
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
-    *	@param trackName : 轨迹名称
+    *	@param sPathName : 轨迹名称
     *	@param return: 错误码
     '''
 
-    def HRIF_MovePathL(self, boxID, rbtID, trackName):
+    def HRIF_MovePathL(self, boxID, rbtID, sPathName):
         result = []
         command = 'MovePathL,'
         command += str(rbtID) + ','
-        command += trackName
-        command += ',;'
+        command += str(sPathName) + ','
+        command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 13
+    *	@index : 14
     *	@param brief:设置MovePath速度比
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3409,6 +4769,183 @@ class CPSClient(object):
         command += str(rbtID) + ','
         command += str(MovePathOverride)
         command += ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 15
+    *	@param brief:初始化轨迹
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *   @param nRawDataType: 原始点位类型 0：关节 1：空间
+    *	@param sPathName : 轨迹名称
+    *	@param vel : 运动速度
+    *	@param acc : 运动加速度
+    *	@param jerk : 运动加加速度
+    *	@param ucs : 指定轨迹所在的用户坐标系名称
+    *	@param tcp : 指定轨迹所在的工具坐标值名称
+    *	@param return: 错误码
+    '''
+
+    def HRIF_InitPath(self, boxID, rbtID, nRawDataType, sPathName, dSpeedRatio, dRadius, vel, acc, jerk, ucs, tcp):
+        result = []
+        command = 'InitPath,'
+        command += str(rbtID) + ','
+        command += str(nRawDataType) + ','
+        command += sPathName + ','
+        command += str(dSpeedRatio) + ','
+        command += str(dRadius) + ','
+        command += str(vel) + ','
+        command += str(acc) + ','
+        command += str(jerk) + ','
+        command += ucs + ','
+        command += tcp + ','
+        command += ';'
+        # print(command)
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 16
+    *	@param brief:向轨迹中批量推送原始点位（可多次调用）(MovePathJ/MovePathL均有效)
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param sPathName : 轨迹名称
+    *	@param sPoints : 点位数据，每个数据以逗号分隔。每个点位6个坐标值，
+    *                    因此此字段值个数必须是6的倍数。系统自动计算出点位个数。
+    *	@param return: 错误码
+    '''
+
+    def HRIF_PushPathPoints(self, boxID, rbtID, sPathName, sPoints):
+        result = []
+        command = 'PushPathPoints,'
+        command += str(rbtID) + ','
+        command += sPathName
+        command += ','
+        for pos in sPoints:
+            command += str(pos) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 17
+    *	@param brief:结束向轨迹中推送点位，并开始计算轨迹(MovePathJ/MovePathL均有效)
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param sPathName : 轨迹名称
+    *	@param return: 错误码
+    '''
+
+    def HRIF_EndPushPathPoints(self, boxID, rbtID, sPathName):
+        result = []
+        command = 'EndPushPathPoints,'
+        command += str(rbtID) + ','
+        command += sPathName + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 18
+    *	@param brief:删除指定轨迹(MovePathJ/MovePathL均有效)
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param sPathName : 轨迹名称
+    *	@param return: 错误码
+    '''
+
+    def HRIF_DelPath(self, boxID, rbtID, sPathName):
+        result = []
+        command = 'DelPath,'
+        command += str(rbtID) + ','
+        command += sPathName + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 19
+    *	@param brief:读取所有轨迹列表
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param result: 轨迹列表   
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadPathList(self, boxID, rbtID, result):
+        command = 'ReadPath,'
+        command += str(rbtID) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 20
+    *	@param brief:读取指定轨迹的详细信息
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param sPathName : 轨迹名称
+    *	@param result[0] :  nRawDataType 原始点位类型
+                0: 关节坐标 1: 空间坐标
+    *	@param result[1] :  stateJ MovePathJ的状态
+                0: 未示教 1: 示教中 4：示教完 2：计算中 5：计算出错 3：计算完成 9：已导入 10：导入后处理
+    *	@param result[2] :  ErrorCodeJ MovePathJ状态对应的错误码
+    *	@param result[3] :  stateL
+                0: 未示教 1: 示教中 4：示教完 2：计算中 5：计算出错 3：计算完成 9：已导入 10：导入后处理
+    *	@param result[4] :  ErrorCodeL MovePathL状态对应的错误码
+    *	@param result[5] :  dbOverride 轨迹运动速度比
+    *	@param result[6] :  dbRadius 过渡半径
+    *	@param result[7] :  dbLinearVel 轨迹运动速度
+    *	@param result[8] :  dbLinearAcc 轨迹运动加速度
+    *	@param result[9] :  dbLinearJerk 轨迹运动加加速度
+    *	@param result[10] :  dUcp_X-dUcp_Rz 用户坐标
+    *	@param result[11] :  dTcp_X-dTcp_Rz 工具坐标
+    *	@param result[12] :  nRawPointCount 原始点位个数
+    *	@param result[13] :  HeadPoin[] 原始点位坐标第一个点
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadPathInfo(self, boxID, rbtID, sPathName, result):
+        command = 'ReadPath,'
+        command += str(rbtID) + ','
+        command += sPathName + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 21
+    *	@param brief:更新指定轨迹的名称(MovePathJ/MovePathL均有效)
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param sPathName : 轨迹名称
+    *	@param sPathNewName : 新轨迹名称
+    *	@param return: 错误码
+    '''
+
+    def HRIF_UpdatePathName(self, boxID, rbtID, sPathName, sPathNewName):
+        result = []
+        command = 'UpdatePathName,'
+        command += str(rbtID) + ','
+        command += sPathName + ','
+        command += sPathNewName + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 22
+    *	@param brief:读取轨迹的状态
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param sPathName : 轨迹名称
+    *	@param result[0] :  nStateJ MovePathJ的状态
+                0: 未示教 1: 示教中 4：示教完 2：计算中 5：计算出错 3：计算完成 9：已导入 10：导入后处理
+    *	@param result[1] :  nErrorCodeJ MovePathJ状态对应的错误码
+    *	@param result[2] :  nStateL
+                0: 未示教 1: 示教中 4：示教完 2：计算中 5：计算出错 3：计算完成 9：已导入 10：导入后处理
+    *	@param result[3] :  nErrorCodeL MovePathL状态对应的错误码
+    *	@param return: 错误码
+    '''
+
+    def HRIF_ReadPathState(self, boxID, rbtID, sPathName, result):
+        command = 'ReadPathState,'
+        command += str(rbtID) + ','
+        command += sPathName + ','
+        command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     #
@@ -3476,6 +5013,52 @@ class CPSClient(object):
 
     '''
     *	@index : 4
+    *	@param brief:在SpeedJ模式下，下发关节命令速度指令
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param cmdVel : 更新的各关节命令关节速度，单位：°/s
+    *	@param acc : 关节设定加速度，单位：°/s^2
+    *	@param runtime : 指令运行超过该时间，运动将会停止。单位：s
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SpeedJ(self, boxID, rbtID, cmdVel, acc, runtime):
+        result = []
+        command = 'SpeedJ,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(cmdVel[i]) + ','
+        command += str(acc) + ','
+        command += str(runtime) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 5
+    *	@param brief:在SpeedL模式下，下发关节命令速度指令
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param cmdVel : 更新的空间运动速度，单位：mm/s
+    *	@param linearAcc : 直线设定加速度
+    *	@param acc : 角度设定加速度，单位：°/s^2
+    *	@param runtime : 指令运行超过该时间，运动将会停止。单位：s
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SpeedL(self, boxID, rbtID, cmdVel, linearAcc, acc, runtime):
+        result = []
+        command = 'SpeedL,'
+        command += str(rbtID) + ','
+        for i in range(0, 6):
+            command += str(cmdVel[i]) + ','
+        command += str(linearAcc) + ','
+        command += str(acc) + ','
+        command += str(runtime) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 6
     *	@param brief:初始化在线控制模式，清空缓存点位,ServoEsJ
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3490,7 +5073,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 5
+    *	@index : 7
     *	@param brief:启动在线控制模式，设定位置固定更新的周期和前瞻时间，开始运动
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3509,7 +5092,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 6
+    *	@index : 8
     *	@param brief:批量下发在线控制点位,每个点位下发频率由固定更新的周期确定
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3529,7 +5112,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 7
+    *	@index : 9
     *	@param brief:读取当前是否可以继续下发点位信息，循环读取间隔>20ms
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3581,14 +5164,14 @@ class CPSClient(object):
     *	@param return: 错误码
     '''
 
-    def HRIF_SetMoveTraceInitParams(self, boxID, rbtID, dK, dB, maxLimit, minLinit):
+    def HRIF_SetMoveTraceInitParams(self, boxID, rbtID, dK, dB, maxLimit, minLimit):
         result = []
         command = 'SetMoveTraceInitParams,'
         command += str(rbtID) + ','
         command += str(dK) + ','
         command += str(dB) + ','
         command += str(maxLimit) + ','
-        command += str(minLinit) + ','
+        command += str(minLimit) + ','
         command += ';'
         return self.g_clients[boxID].sendAndRecv(command, result)
 
@@ -3627,7 +5210,142 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     #
-    # part 14 其他指令
+    # part 14 位置跟随类指令
+    #
+    '''
+    *	@index : 1
+    *	@param brief: 设置位置跟随的最大跟随速度
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param dMaxLineVel: 直线最大速度
+    *	@param dMaxOriVel:  姿态最大速度
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetPoseTrackingMaxMotionLimit(self, boxID, rbtID, dMaxLineVel, dMaxOriVel):
+        result = []
+        command = 'SetPoseTrackingMaxMotionLimit,'
+        command += str(rbtID) + ','
+        command += str(dMaxLineVel) + ','
+        command += str(dMaxOriVel) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 2
+    *	@param brief: 设置位置跟踪超时停止时间
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param dTime: 超时停止时间
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetPoseTrackingStopTimeOut(self, boxID, rbtID, dTime):
+        result = []
+        command = 'SetPoseTrackingStopTimeOut,'
+        command += str(rbtID) + ','
+        command += str(dTime) + ',;'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 3
+    *	@param brief: 设置PID参数
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param dPosPID1: 跟随位置pid
+    *	@param dPosPID2: 跟随位置pid
+    *	@param dPosPID3: 跟随位置pid
+    *	@param dOriPID1: 姿态位置pid
+    *	@param dOriPID2: 姿态位置pid
+    *	@param dOriPID3: 姿态位置pid
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetPoseTrackingPIDParams(self, boxID, rbtID, dPosPID1, dPosPID2, dPosPID3, dOriPID1, dOriPID2, dOriPID3):
+        result = []
+        command = 'SetPoseTrackingPIDParams,'
+        command += str(rbtID) + ','
+        command += str(dPosPID1) + ','
+        command += str(dPosPID2) + ','
+        command += str(dPosPID3) + ','
+        command += str(dOriPID1) + ','
+        command += str(dOriPID2) + ','
+        command += str(dOriPID3) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 4
+    *	@param brief:  设置位置跟随的目标位置
+    *	@param boxID:  电箱ID
+    *	@param rbtID:  机器人ID,一般为0
+    *	@param dX:     X方向保持的距离
+    *	@param dY:     Y方向保持的距离
+    *	@param dZ:     Z方向保持的距离
+    *	@param dRx:    Rx方向保持的距离
+    *	@param dRy:    Ry方向保持的距离
+    *	@param dRz:    Rz方向保持的距离
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetPoseTrackingTargetPos(self, boxID, rbtID, dX, dY, dZ, dRx, dRy, dRz):
+        result = []
+        command = 'SetPoseTrackingTargetPos,'
+        command += str(rbtID) + ','
+        command += str(dX) + ','
+        command += str(dY) + ','
+        command += str(dZ) + ','
+        command += str(dRx) + ','
+        command += str(dRy) + ','
+        command += str(dRz) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 5
+    *	@param brief:  设置位置跟随状态
+    *	@param boxID:  电箱ID
+    *	@param rbtID:  机器人ID,一般为0
+    *	@param nState: 跟随的状态
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetPoseTrackingState(self, boxID, rbtID, nState):
+        result = []
+        command = 'SetPoseTrackingState,'
+        command += str(rbtID) + ','
+        command += str(nState) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    '''
+    *	@index : 6
+    *	@param brief: 设置实时更新传感器位置信息
+    *	@param boxID:电箱ID
+    *	@param rbtID:机器人ID,一般为0
+    *	@param dX:  检测到的X方向保持的距离
+    *	@param dY:  检测到的Y方向保持的距离
+    *	@param dZ:  检测到的Z方向保持的距离
+    *	@param dRx: 检测到的Rx方向保持的距离
+    *	@param dRy: 检测到的Ry方向保持的距离
+    *	@param dRz: 检测到的Rz方向保持的距离
+    *	@param return: 错误码
+    '''
+
+    def HRIF_SetUpdateTrackingPose(self, boxID, rbtID, dX, dY, dZ, dRx, dRy, dRz):
+        result = []
+        command = 'SetUpdateTrackingPose,'
+        command += str(rbtID) + ','
+        command += str(dX) + ','
+        command += str(dY) + ','
+        command += str(dZ) + ','
+        command += str(dRx) + ','
+        command += str(dRy) + ','
+        command += str(dRz) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
+
+    #
+    # part 15 其他指令
     #
 
     '''
@@ -3638,6 +5356,15 @@ class CPSClient(object):
     *	@param param:插件指令及参数
     *	@param return: 错误码
     '''
+
+    def HRIF_HRApp(self, boxID, name, cmd, param, result):
+        command = 'HRAppCmd,'
+        command += str(name) + ','
+        command += str(cmd) + ','
+        for i in range(len(param)):
+            command += str(param[i]) + ','
+        command += ';'
+        return self.g_clients[boxID].sendAndRecv(command, result)
 
     def HRIF_HRAppCmd(self, boxID, name, cmd, param, result):
         command = 'HRAppCmd,'
@@ -3677,7 +5404,7 @@ class CPSClient(object):
         return self.g_clients[boxID].sendAndRecv(command, result)
 
     '''
-    *	@index : 
+    *	@index : 3
     *	@param brief:读取末端Modbus寄存器
     *	@param boxID:电箱ID
     *	@param rbtID:机器人ID,一般为0
@@ -3707,7 +5434,7 @@ class CPSClient(object):
         return retData
 
     '''
-    *	@index : 
+    *	@index : 4
     *	@param brief:等待机器人运动停止
     *	@param return: 错误码
     '''
@@ -3730,9 +5457,11 @@ class CPSClient(object):
     # sendVarValue
     # No output
 
-    def cdsSetIO(self, boxID, nEndDOMask, nEndDOVal, nBoxDOMask, nBoxDOVal, nBoxCOMask, nBoxCOVal, nBoxAOCH0_Mask,
-                 nBoxAOCH0_Mode, nBoxAOCH1_Mask, nBoxAOCH1_Mode, dbBoxAOCH0_Val, dbBoxAOCH1_Val, result):
+    def HRIF_cdsSetIO(self, boxID, rbtID, nEndDOMask, nEndDOVal, nBoxDOMask, nBoxDOVal, nBoxCOMask, nBoxCOVal, nBoxAOCH0_Mask,
+                 nBoxAOCH0_Mode, nBoxAOCH1_Mask, nBoxAOCH1_Mode, dbBoxAOCH0_Val, dbBoxAOCH1_Val):
+        result = []
         command = 'cdsSetIO,'
+        command += str(rbtID) + ','
         command += str(nEndDOMask) + ','
         command += str(nEndDOVal) + ','
         command += str(nBoxDOMask) + ','
@@ -3800,31 +5529,3 @@ def WriteDint(value, reverse=False):
     else:
         v = [m, n]
     return v
-
-
-if __name__ == '__main__':
-    client = CPSClient()
-    boxID = 0  # 假设您使用的是第一个电箱
-    rbtID = 0  # 假设您使用的是第一个机器人
-
-    # 连接到电箱和控制器
-    client.HRIF_Connect(boxID, '192.168.11.7', 10003)
-    client.HRIF_Connect2Controller(boxID)
-
-    current_pose = []
-    client.HRIF_ReadActPos(boxID, rbtID, current_pose)
-    current_pose = [float(num) for num in current_pose]
-    target_pose = current_pose[6:12]
-    target_joint = current_pose[0:6]
-    print("pose = ",target_pose)
-    print("joint = ",target_joint)
-
-    # target_pose[3:6] = [180 - 43.27147704196139, 16.100274074694543, 15.116146464420966]
-    target_pose[3:6] = [-90, -20, 0]
-    target_pose[0:3] = [50,400,800]
-    # client.moveJ_robot([83.795, 4.731, 111.311, -1.832, -77.408, -109.852])
-    # client.move_robot(target_pose=target_pose)
-
-    # target_pose = np.array([-0.31735*1000, 0.84271*1000, 0.36603, -180, -0.00040317, 33.258])
-    #
-    # # target_pose[2] = target_pose[2] + 50
